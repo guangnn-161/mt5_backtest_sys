@@ -71,7 +71,6 @@ def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: P
     # Lấy dữ liệu Equity Curve được truyền từ engine qua attrs
     if df_trades is not None and hasattr(df_trades, 'attrs') and 'equity_curve' in df_trades.attrs:
         df_eq = df_trades.attrs['equity_curve']
-        fail_idx = df_trades.attrs.get('first_fail_index', None)
     else:
         # Fallback an toàn nếu không có dữ liệu
         plt.savefig(save_path)
@@ -92,7 +91,7 @@ def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: P
 
         # Vẽ đoạn bình thường (Màu xanh dương)
         plt.plot(times[normal_mask], equities[normal_mask],
-                 color='tab:blue', linewidth=2, label='Hoạt động hợp lệ (Safe)')
+                 color='tab:blue', linewidth=2, label='Before hard breach')
 
         # Vẽ đoạn sau khi đã fail quỹ (Màu cam/xám cảnh báo)
         # Nối điểm cuối của đoạn normal với điểm đầu của đoạn failed để đường đi liền mạch không bị đứt đoạn
@@ -103,14 +102,25 @@ def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: P
                      color='tab:orange', linestyle='--', linewidth=1.5)
 
         plt.plot(times[failed_mask], equities[failed_mask], color='tab:orange',
-                 linestyle='--', linewidth=1.5, label='Đã Fail FTMO (Stress-test zone)')
+                 linestyle='--', linewidth=1.5, label='After FTMO hard breach')
     else:
         # Trường hợp không vi phạm lần nào suốt quãng đường test
         plt.plot(times, equities, color='tab:green',
-                 linewidth=2, label='Hoàn hảo (No Violation)')
+                 linewidth=2, label='No FTMO hard breach')
 
-    plt.axhline(y=10000, color='black', linestyle=':',
-                label='Initial Balance ($10,000)')
+    if 'internal_stop' in df_eq.columns and df_eq['internal_stop'].any():
+        internal_idx = df_eq[df_eq['internal_stop']].index[0]
+        plt.scatter(
+            times.iloc[internal_idx], equities.iloc[internal_idx],
+            color='tab:red', marker='x', s=80, zorder=5,
+            label='Internal safety stop',
+        )
+
+    initial_balance = float(
+        metrics.get('initial_balance', df_trades.attrs.get('initial_balance', 10000))
+    )
+    plt.axhline(y=initial_balance, color='black', linestyle=':',
+                label=f'Initial Balance (${initial_balance:,.0f})')
     plt.title(
         f"Equity Curve - {strategy_name} (Run ID: {run_id})", fontsize=14, fontweight='bold')
     plt.xlabel("Thời gian", fontsize=11)

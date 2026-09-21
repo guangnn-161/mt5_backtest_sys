@@ -31,7 +31,9 @@ def fetch_mt5_data(symbol: str, timeframe, num_bars: int):
 
     # 3. Chuyển đổi dữ liệu thô sang Pandas DataFrame
     df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
+    # MT5 exposes Unix epoch seconds. Preserve UTC explicitly so the backtester
+    # can convert daily reset boundaries without guessing the source timezone.
+    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
 
     # 4. Định hình đường dẫn lưu file theo chuẩn kiến trúc
     project_root = Path(__file__).parent.parent

@@ -53,8 +53,8 @@ def main():
     with open(config_path, 'r') as f:
         strat_params = yaml.safe_load(f)
 
-    df = load_data(ROOT_DIR / "data" / "raw" / "xauusdm_m5.csv")
-    print(f"[*] Đã nạp {len(df)} nến dữ liệu.")
+    raw_df = load_data(ROOT_DIR / "data" / "raw" / "xauusdm_m5.csv")
+    print(f"[*] Đã nạp {len(raw_df)} nến dữ liệu.")
 
     # 2. Khởi tạo các module lõi
     guard = ComplianceGuard(ROOT_DIR / "configs" / "ftmo_rules.yaml",
@@ -70,7 +70,7 @@ def main():
     strategy = StrategyClass(strat_params)
 
     # 3. Tự động nạp chỉ báo (Indicator) của chiến lược
-    df = strategy.prepare_data(df)
+    df = strategy.prepare_data(raw_df.copy())
 
     # 4. Chạy Backtest Engine
     print("[*] Đang chạy Backtest Engine...")
@@ -90,14 +90,14 @@ def main():
     # 6. Chạy phòng giả lập Monte Carlo
     print("[*] Đang chạy Monte Carlo (10,000 kịch bản)...")
     mc = MonteCarloFTMO(ROOT_DIR / "configs" / "ftmo_rules.yaml")
-    pnl_pct_list = df_trades['pnl_pct'].tolist()
-    mc_metrics = mc.run_simulation(pnl_pct_list, n_sims=10000)
+    mc_metrics = mc.run_simulation(
+        df_trades[['exit_time', 'pnl_pct']], n_sims=10000)
     print(f"[*] Xác suất Pass FTMO (p_pass): {mc_metrics['p_pass']}%")
 
     # 7. Rolling-window: rủi ro chế độ thị trường, độc lập với Monte Carlo reshuffle.
-    print("[*] Đang chạy Rolling Window Backtest (30 ngày, bước 5 ngày)...")
+    print("[*] Đang chạy Rolling-window Robustness Test (30 ngày, bước 5 ngày)...")
     rolling_results = run_rolling_window_backtest(
-        df=df,
+        df=raw_df,
         strategy_factory=lambda: StrategyClass(strat_params),
         ftmo_rules_path=ROOT_DIR / "configs" / "ftmo_rules.yaml",
         risk_params_path=ROOT_DIR / "configs" / "risk_params.yaml",
@@ -110,6 +110,7 @@ def main():
     # 8. Ghi Log và Lưu Báo cáo tự động theo tên chiến lược
     combined_metrics = {
         **metrics,
+        "initial_balance": guard.initial_balance,
         "monte_carlo": mc_metrics,
         "rolling_window": rolling_metrics,
     }

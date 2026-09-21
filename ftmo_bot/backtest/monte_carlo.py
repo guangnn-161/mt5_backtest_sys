@@ -1,112 +1,130 @@
+"""Day-block bootstrap for FTMO outcome estimates."""
+
+from __future__ import annotations
+
 import numpy as np
+import pandas as pd
 import yaml
-from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 class MonteCarloFTMO:
-    def __init__(self, ftmo_config_path: str, avg_trades_per_day: int = 3):
-        """
-        avg_trades_per_day: Tham số giả định số lệnh trung bình mỗi ngày để mô phỏng mốc reset Daily Loss.
-        """
-        with open(ftmo_config_path, 'r') as f:
-            self.rules = yaml.safe_load(f)
+    def __init__(self, ftmo_config_path: str, block_days: int = 5):
+        with open(ftmo_config_path, "r", encoding="utf-8") as file:
+            self.rules = yaml.safe_load(file)
 
-        self.target_pct = self.rules["profit_target_pct"]
-        self.max_dd_pct = self.rules["max_total_loss_pct"]
-        self.max_daily_loss_pct = self.rules["max_daily_loss_pct"]
-
-        # Kiểm tra loại Drawdown (FTMO tiêu chuẩn thường là static_from_initial)
+        self.target_pct = float(self.rules["profit_target_pct"])
+        self.max_dd_pct = float(self.rules["max_total_loss_pct"])
+        self.max_daily_loss_pct = float(self.rules["max_daily_loss_pct"])
         self.dd_type = self.rules.get("drawdown_type", "static_from_initial")
-        self.avg_trades_per_day = avg_trades_per_day
+        self.daily_reset_timezone = ZoneInfo(
+            self.rules.get("daily_reset_timezone", "Europe/Prague")
+        )
+        self.block_days = int(block_days)
+        if self.block_days <= 0:
+            raise ValueError("block_days must be greater than zero")
 
-    def run_simulation(self, trade_pnl_pct: list, n_sims: int = 10000, seed: int = 42) -> dict:
-        """
-        Thực thi Monte Carlo Simulation.
-        trade_pnl_pct: list hoặc array chứa % PnL của từng lệnh (ví dụ: [1.2, -0.5, 0.8, -0.5...]).
-        """
-        if not trade_pnl_pct:
+    def _daily_sequences(self, trades) -> list[list[float]]:
+        frame = trades.copy() if isinstance(trades, pd.DataFrame) else pd.DataFrame(trades)
+        if frame.empty:
+            raise ValueError("Trade history is empty; run the backtest first")
+        required = {"exit_time", "pnl_pct"}
+        missing = required.difference(frame.columns)
+        if missing:
             raise ValueError(
-                "Danh sách lệnh trống. Cần chạy Backtest Engine trước.")
+                "Monte Carlo requires actual trade dates; missing columns: "
+                + ", ".join(sorted(missing))
+            )
 
+        frame = frame.loc[:, ["exit_time", "pnl_pct"]].copy()
+        frame["exit_time"] = pd.to_datetime(frame["exit_time"], utc=True)
+        frame = frame.sort_values("exit_time")
+        frame["trading_day"] = (
+            frame["exit_time"].dt.tz_convert(self.daily_reset_timezone).dt.date
+        )
+        return [
+            group["pnl_pct"].astype(float).tolist()
+            for _, group in frame.groupby("trading_day", sort=True)
+        ]
+
+    def _sample_days(self, days, rng):
+        """Sample contiguous blocks, retaining order and trade count within each day."""
+        sampled = []
+        while len(sampled) < len(days):
+            start = int(rng.integers(0, len(days)))
+            for offset in range(self.block_days):
+                sampled.append(days[(start + offset) % len(days)])
+                if len(sampled) == len(days):
+                    break
+        return sampled
+
+    def run_simulation(
+        self, trades, n_sims: int = 10000, seed: int = 42
+    ) -> dict:
+        """Bootstrap real trading-day blocks instead of inventing N trades/day."""
+        if n_sims <= 0:
+            raise ValueError("n_sims must be greater than zero")
+        days = self._daily_sequences(trades)
         rng = np.random.default_rng(seed)
 
         outcomes = {
             "pass": 0,
             "fail_max_dd": 0,
             "fail_daily_loss": 0,
-            "timeout": 0
+            "timeout": 0,
         }
-
         max_drawdowns = []
         days_to_pass = []
 
         for _ in range(n_sims):
-            # Bootstrap: Lấy mẫu ngẫu nhiên CÓ HOÀN LẠI (Tạo kịch bản chuỗi thua khắc nghiệt hơn lịch sử)
-            shuffled_trades = rng.choice(
-                trade_pnl_pct, size=len(trade_pnl_pct), replace=True)
-
-            equity = 100.0  # Bắt đầu với 100% balance
+            sampled_days = self._sample_days(days, rng)
+            equity = 100.0
             peak_equity = 100.0
-            daily_start_equity = 100.0
-
             sim_status = "timeout"
-            min_dd_this_sim = 0.0
+            max_dd_this_sim = 0.0
 
-            for trade_idx, pnl in enumerate(shuffled_trades):
-                # 1. Mô phỏng chuyển ngày (Reset mốc Daily Loss)
-                if trade_idx > 0 and trade_idx % self.avg_trades_per_day == 0:
-                    daily_start_equity = equity
+            for day_number, daily_trades in enumerate(sampled_days, start=1):
+                daily_start_balance = equity
+                for pnl in daily_trades:
+                    equity *= 1 + pnl / 100
+                    peak_equity = max(peak_equity, equity)
 
-                # 2. Cập nhật Equity sau lệnh
-                equity *= (1 + pnl / 100)
+                    if self.dd_type == "trailing_from_peak":
+                        current_dd = (peak_equity - equity) / peak_equity * 100
+                    else:
+                        current_dd = (100.0 - equity) / 100.0 * 100
+                    max_dd_this_sim = max(max_dd_this_sim, current_dd)
 
-                # Cập nhật đỉnh Equity nếu là dạng Trailing Drawdown
-                if equity > peak_equity:
-                    peak_equity = equity
-
-                # 3. Tính toán Drawdown hiện tại
-                if self.dd_type == "trailing_from_peak":
-                    current_dd = ((peak_equity - equity) / peak_equity) * 100
-                else:  # static_from_initial
-                    current_dd = ((100.0 - equity) / 100.0) * 100
-
-                if current_dd > min_dd_this_sim:
-                    min_dd_this_sim = current_dd
-
-                # 4. KIỂM TRA GUARD (Luật tử hình)
-                # Vi phạm Max Total Drawdown
-                if current_dd >= self.max_dd_pct:
-                    sim_status = "fail_max_dd"
+                    # FTMO percentage limits are based on initial account size.
+                    daily_loss = (daily_start_balance - equity) / 100.0 * 100
+                    if daily_loss >= self.max_daily_loss_pct:
+                        sim_status = "fail_daily_loss"
+                        break
+                    if current_dd >= self.max_dd_pct:
+                        sim_status = "fail_max_dd"
+                        break
+                    if equity >= 100.0 + self.target_pct:
+                        sim_status = "pass"
+                        days_to_pass.append(day_number)
+                        break
+                if sim_status != "timeout":
                     break
 
-                # Vi phạm Daily Loss
-                daily_loss = ((daily_start_equity - equity) /
-                              daily_start_equity) * 100
-                if daily_loss >= self.max_daily_loss_pct:
-                    sim_status = "fail_daily_loss"
-                    break
-
-                # 5. Kiểm tra mục tiêu Pass quỹ
-                if equity >= 100.0 + self.target_pct:
-                    sim_status = "pass"
-                    days_to_pass.append(
-                        (trade_idx + 1) / self.avg_trades_per_day)
-                    break
-
-            # Ghi nhận kết quả cuối cùng của 1 kịch bản (1 vũ trụ)
             outcomes[sim_status] += 1
-            max_drawdowns.append(min_dd_this_sim)
-
-        # Trích xuất và định dạng kết quả thống kê
-        avg_days = np.mean(days_to_pass) if days_to_pass else 0.0
+            max_drawdowns.append(max_dd_this_sim)
 
         return {
-            "p_pass": round((outcomes["pass"] / n_sims) * 100, 2),
-            "p_fail_max_dd": round((outcomes["fail_max_dd"] / n_sims) * 100, 2),
-            "p_fail_daily_loss": round((outcomes["fail_daily_loss"] / n_sims) * 100, 2),
-            "p_timeout": round((outcomes["timeout"] / n_sims) * 100, 2),
+            "method": f"{self.block_days}-day block bootstrap",
+            "source_trading_days": len(days),
+            "p_pass": round(outcomes["pass"] / n_sims * 100, 2),
+            "p_fail_max_dd": round(outcomes["fail_max_dd"] / n_sims * 100, 2),
+            "p_fail_daily_loss": round(
+                outcomes["fail_daily_loss"] / n_sims * 100, 2
+            ),
+            "p_timeout": round(outcomes["timeout"] / n_sims * 100, 2),
             "max_dd_mean": round(float(np.mean(max_drawdowns)), 2),
-            # Rủi ro đuôi (Kịch bản tệ nhất)
             "max_dd_p95": round(float(np.percentile(max_drawdowns, 95)), 2),
-            "avg_days_to_pass": round(float(avg_days), 1)
+            "avg_days_to_pass": round(float(np.mean(days_to_pass)), 1)
+            if days_to_pass
+            else 0.0,
         }

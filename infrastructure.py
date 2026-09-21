@@ -33,7 +33,8 @@ def create_project_structure(base_dir="ftmo_bot"):
         "profit_target_pct": 10.0,
         "profit_target_usd": 1000,
         "drawdown_type": "static_from_initial", # Tính từ initial balance
-        "daily_reset_timezone": "CET" # Giờ server FTMO
+        "data_timezone": "UTC",
+        "daily_reset_timezone": "Europe/Prague"
     }
     with open(os.path.join(base_dir, "configs/ftmo_rules.yaml"), 'w') as f:
         yaml.dump(ftmo_rules, f, default_flow_style=False, sort_keys=False)
@@ -44,7 +45,16 @@ def create_project_structure(base_dir="ftmo_bot"):
         "max_open_risk_pct": 1.5,  # Tổng rủi ro tối đa tại 1 thời điểm
         "daily_loss_buffer_pct": 1.0, # Buffer: dừng trade khi loss chạm 4% (5% - 1%)
         "total_loss_buffer_pct": 1.5, # Buffer: dừng hoàn toàn khi total loss chạm 8.5%
-        "max_slippage_points": 20
+        "caution_threshold_ratio": 0.6,
+        "critical_threshold_ratio": 0.9,
+        "execution": {
+            "contract_size": 100,
+            "point_size": 0.01,
+            "spread_points": 20,
+            "slippage_points": 5,
+            "commission_per_lot_round_turn_usd": 0.0,
+            "intrabar_policy": "stop_first",
+        },
     }
     with open(os.path.join(base_dir, "configs/risk_params.yaml"), 'w') as f:
         yaml.dump(risk_params, f, default_flow_style=False, sort_keys=False)
@@ -59,8 +69,9 @@ def create_project_structure(base_dir="ftmo_bot"):
             "new_york": {"enable": False, "start": "14:30", "end": "23:59"} # Né phiên Mỹ
         },
         "momentum_params": {
-            "placeholder_lookback": 14,
-            "placeholder_threshold": 1.5
+            "body_threshold": 2.0,
+            "stop_distance": 5.0,
+            "target_distance": 10.0,
         }
     }
     with open(os.path.join(base_dir, "configs/strategy_params.yaml"), 'w') as f:
