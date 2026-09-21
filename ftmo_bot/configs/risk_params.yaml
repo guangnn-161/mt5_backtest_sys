@@ -1,0 +1,8 @@
+risk_per_trade_pct: 0.5
+max_open_risk_pct: 1.5
+daily_loss_buffer_pct: 1.0
+total_loss_buffer_pct: 1.5
+max_slippage_points: 20
+# Thêm vào cuối file risk_params.yaml hiện có
+caution_threshold_ratio: 0.6    # Vào tầng Caution khi đã dùng 60% ngưỡng an toàn
+critical_threshold_ratio: 0.9   # Vào tầng Critical khi đã dùng 90% ngưỡng an toàn

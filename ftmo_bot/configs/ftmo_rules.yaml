@@ -1,0 +1,10 @@
+account_size: 10000
+currency: USD
+max_daily_loss_pct: 5.0
+max_daily_loss_usd: 500
+max_total_loss_pct: 10.0
+max_total_loss_usd: 1000
+profit_target_pct: 10.0
+profit_target_usd: 1000
+drawdown_type: static_from_initial
+daily_reset_timezone: CET
