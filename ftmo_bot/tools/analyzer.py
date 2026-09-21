@@ -77,6 +77,11 @@ def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: P
         plt.close()
         return
 
+    if df_eq.empty:
+        plt.savefig(save_path)
+        plt.close()
+        return
+
     times = df_eq['time']
     equities = df_eq['equity']
 
@@ -102,7 +107,9 @@ def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: P
                      color='tab:orange', linestyle='--', linewidth=1.5)
 
         plt.plot(times[failed_mask], equities[failed_mask], color='tab:orange',
-                 linestyle='--', linewidth=1.5, label='After FTMO hard breach')
+                 linestyle='--', linewidth=1.5, label='Post-failure simulation')
+        plt.axvline(times.iloc[fail_start_idx], color='tab:red', linestyle=':',
+                    label='First hard breach')
     else:
         # Trường hợp không vi phạm lần nào suốt quãng đường test
         plt.plot(times, equities, color='tab:green',
@@ -130,13 +137,16 @@ def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: P
 
     # Thêm bảng thông số tóm tắt dưới biểu đồ
     mc = metrics.get('monte_carlo', {})
+    def mc_pct(key):
+        return f"{mc[key]}%" if key in mc else "N/A"
+
     table_data = [
         ["Total Trades", metrics.get(
-            'total_trades', 0), "Monte Carlo p_pass", f"{mc.get('p_pass', 0)}%"],
+            'total_trades', 0), "Monte Carlo p_pass", mc_pct('p_pass')],
         ["Win Rate", f"{metrics.get('win_rate_pct', 0)}%",
-         "MC Worst Drawdown (p95)", f"{mc.get('max_dd_p95', 0)}%"],
+         "MC Worst Drawdown (p95)", mc_pct('max_dd_p95')],
         ["Net Profit", f"${metrics.get('net_profit', 0)}",
-         "MC Fail by Daily Loss", f"{mc.get('p_fail_daily_loss', 0)}%"],
+         "MC Fail by Daily Loss", mc_pct('p_fail_daily_loss')],
         ["Profit Factor", metrics.get('profit_factor', 0), "Max Consec Losses",
          metrics.get('max_consecutive_losses_count', 'N/A')]
     ]

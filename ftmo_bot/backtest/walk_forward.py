@@ -105,6 +105,11 @@ def run_rolling_window_backtest(
             "days_to_result": days_to_result,
             "max_dd_in_window_pct": max_dd_pct,
             "num_trades": len(trades_to_result),
+            "num_trades_full_simulation": len(trades),
+            "post_failure_trades": (
+                int(trades['post_failure_entry'].sum()) if not trades.empty else 0
+            ),
+            "ending_balance_full_simulation": trades.attrs['ending_balance'],
         })
 
         start_idx += step_days

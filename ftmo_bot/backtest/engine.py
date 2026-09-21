@@ -23,11 +23,13 @@ class BacktestEngine:
         risk_manager,
         compliance_guard,
         trading_start_time=None,
+        continue_after_failure: bool = True,
     ):
         self.df = self._validate_data(df)
         self.strategy = strategy
         self.risk_manager = risk_manager
         self.compliance_guard = compliance_guard
+        self.continue_after_failure = continue_after_failure
 
         self.initial_balance = compliance_guard.initial_balance
         self.balance = self.initial_balance
@@ -271,8 +273,13 @@ class BacktestEngine:
                 # while live compliance is evaluated against current equity.
                 daily_start_balance = self.balance
 
-            if pending_signal is not None and open_trade is None and not trading_halted:
+            stress_mode = self.continue_after_failure and first_fail_time is not None
+            if pending_signal is not None and open_trade is None and (
+                not trading_halted or stress_mode
+            ):
                 open_trade = self._open_trade(pending_signal, row, timestamp)
+                if open_trade is not None:
+                    open_trade["post_failure_entry"] = stress_mode
                 pending_signal = None
 
             worst_equity = self.balance
@@ -315,7 +322,8 @@ class BacktestEngine:
             trading_state = self.compliance_guard.get_trading_state(
                 self.equity, daily_start_balance, peak_equity
             )
-            if trading_state == "critical" and open_trade is not None:
+            stress_mode = self.continue_after_failure and first_fail_time is not None
+            if trading_state == "critical" and open_trade is not None and not stress_mode:
                 trades.append(
                     self._close_trade(
                         open_trade, float(row["close"]), timestamp, "critical_soft_stop"
@@ -349,16 +357,17 @@ class BacktestEngine:
                 open_trade = None
                 self.equity = self.balance
 
-            # Stateful strategies must observe every completed bar. A signal is
-            # accepted only while flat/safe, but indicator deltas must not become
-            # stale merely because a position is open.
+            # A hard failure is permanent for scoring. After it, research mode
+            # bypasses account-level entry/soft-stop gates so we can observe the
+            # remaining strategy path. SL/TP, costs and position sizing still apply.
+            stress_mode = self.continue_after_failure and first_fail_time is not None
+            # Stateful strategies must observe every completed bar.
             signal = self.strategy.generate_signal(row) if position < last_index else None
             if (
                 signal
                 and open_trade is None
                 and pending_signal is None
-                and trading_state == "safe"
-                and not trading_halted
+                and (stress_mode or (trading_state == "safe" and not trading_halted))
             ):
                 pending_signal = {**signal, "signal_time": timestamp}
 
@@ -370,6 +379,7 @@ class BacktestEngine:
                     "internal_stop": first_internal_stop_time is not None,
                     # Backward-compatible column used by the existing dashboard.
                     "is_failed": first_fail_time is not None,
+                    "stress_mode": stress_mode,
                 }
             )
 
@@ -384,6 +394,7 @@ class BacktestEngine:
                 "equity_curve": pd.DataFrame(equity_curve),
                 "initial_balance": self.initial_balance,
                 "ending_balance": self.balance,
+                "continue_after_failure": self.continue_after_failure,
             }
         )
         return df_trades

@@ -1,6 +1,9 @@
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -12,7 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "ftmo_bot"))
 
 from backtest.engine import BacktestEngine
 from backtest.monte_carlo import MonteCarloFTMO
-from backtest.walk_forward import _compute_max_dd_pct
+from backtest.walk_forward import _compute_max_dd_pct, _classify_outcome, run_rolling_window_backtest
 from risk.compliance_guard import ComplianceGuard
 from risk.risk_manager import RiskManager
 
@@ -34,6 +37,12 @@ class OneShotStrategy:
 
 
 class AlwaysSignalStrategy:
+    def __init__(self, params=None):
+        pass
+
+    def prepare_data(self, frame):
+        return frame
+
     def generate_signal(self, row):
         return {
             "type": "BUY",
@@ -186,6 +195,123 @@ class IntegrityTests(unittest.TestCase):
     def test_drawdown_is_positive_peak_to_trough(self):
         curve = pd.DataFrame({"equity": [10000, 11000, 10450]})
         self.assertAlmostEqual(_compute_max_dd_pct(curve, 10000), 5.0)
+
+    def total_loss_frame(self, days=1):
+        # A gap crosses the total floor before internal gates can prevent it.
+        rules = yaml.safe_load(self.ftmo_path.read_text())
+        rules['max_daily_loss_pct'] = 90.0
+        self.ftmo_path.write_text(yaml.safe_dump(rules))
+        rows = []
+        for day in pd.date_range('2026-01-02', periods=days):
+            for bar in range(60):
+                price = 100 if bar < 2 else 70
+                high = price + (0.5 if bar < 3 else 3)
+                rows.append((day + pd.Timedelta(hours=10, minutes=5 * bar),
+                             price, high, price - 0.5, price))
+        return self.frame(rows)
+
+    def test_total_loss_keeps_trading_and_failure_stays_after_recovery(self):
+        frame = self.total_loss_frame()
+        trades = self.engine(frame, AlwaysSignalStrategy()).run()
+        fail_time = pd.Timestamp(frame.iloc[2].time)
+        self.assertEqual(trades.attrs['first_fail_time'], fail_time)
+        self.assertIn('Max Total', trades.attrs['first_fail_reason'])
+        later = trades[trades.entry_time > fail_time]
+        self.assertGreater(len(later), 1)
+        self.assertTrue(later.post_failure_entry.all())
+        self.assertGreater(trades.iloc[-1].balance, 11000)
+        curve = trades.attrs['equity_curve']
+        self.assertTrue(curve.loc[curve.time >= fail_time, 'is_failed'].all())
+        self.assertFalse(curve.loc[curve.time < fail_time, 'is_failed'].any())
+        self.assertEqual(curve.iloc[-1].time, frame.iloc[-1].time)
+        guard = ComplianceGuard(self.ftmo_path, self.risk_path)
+        outcome, _, result_time = _classify_outcome(
+            trades, guard, frame.iloc[0].time.date(), frame.iloc[-1].time.date())
+        self.assertEqual(outcome, 'fail_total')
+        self.assertEqual(result_time, fail_time)
+
+    def test_daily_failure_continues_across_daily_reset(self):
+        frame = self.total_loss_frame(days=2)
+        rules = yaml.safe_load(self.ftmo_path.read_text())
+        rules['max_daily_loss_pct'] = 5.0
+        self.ftmo_path.write_text(yaml.safe_dump(rules))
+        trades = self.engine(frame, AlwaysSignalStrategy()).run()
+        self.assertIn('Max Daily', trades.attrs['first_fail_reason'])
+        curve = trades.attrs['equity_curve']
+        next_day = curve.time.dt.date == frame.iloc[-1].time.date()
+        self.assertTrue(curve.loc[next_day, 'is_failed'].all())
+        self.assertTrue(curve.loc[next_day, 'stress_mode'].all())
+        self.assertTrue((trades.entry_time.dt.date == frame.iloc[-1].time.date()).any())
+
+    def test_halt_mode_still_available(self):
+        frame = self.total_loss_frame()
+        engine = self.engine(frame, AlwaysSignalStrategy())
+        engine.continue_after_failure = False
+        trades = engine.run()
+        self.assertEqual(len(trades), 1)
+        self.assertFalse(trades.post_failure_entry.any())
+
+    def test_each_rolling_window_runs_after_total_loss(self):
+        frame = self.total_loss_frame(days=4)
+        results = run_rolling_window_backtest(
+            frame, AlwaysSignalStrategy, self.ftmo_path, self.risk_path,
+            window_days=2, step_days=1, warmup_bars=10)
+        self.assertEqual(len(results), 3)
+        self.assertTrue((results.outcome == 'fail_total').all())
+        self.assertTrue((results.post_failure_trades > 0).all())
+        self.assertTrue((results.num_trades_full_simulation > results.num_trades).all())
+
+    def test_dashboard_uses_orange_for_entire_post_failure_path(self):
+        import matplotlib
+        matplotlib.use('Agg')
+        from tools import analyzer
+        frame = self.total_loss_frame()
+        trades = self.engine(frame, AlwaysSignalStrategy()).run()
+        with patch.object(analyzer.plt, 'savefig'), patch.object(analyzer.plt, 'close'):
+            analyzer.plot_equity_curve_split(
+                trades, {}, Path(self.temp_dir.name) / 'dashboard.jpg', 'TEST', 'test')
+            lines = {line.get_label(): line for line in analyzer.plt.gca().lines}
+            line = lines['Post-failure simulation']
+            self.assertEqual(line.get_color(), 'tab:orange')
+            self.assertEqual(pd.Timestamp(line.get_xdata()[-1]), frame.iloc[-1].time)
+            self.assertGreater(len(set(line.get_ydata())), 1)
+            self.assertIn('First hard breach', lines)
+        analyzer.plt.close('all')
+
+    def test_main_runs_rolling_after_failure_and_when_no_trades(self):
+        import main as app
+        import shutil
+        root = Path(self.temp_dir.name)
+        frame = self.total_loss_frame(days=31)
+        (root / 'configs').mkdir()
+        shutil.copy(self.ftmo_path, root / 'configs/ftmo_rules.yaml')
+        shutil.copy(self.risk_path, root / 'configs/risk_params.yaml')
+        (root / 'configs/strategy_params.yaml').write_text('{}')
+        (root / 'reports/test').mkdir(parents=True)
+        # Orchestration uses the real engine; rolling itself is tested above.
+        for has_trades in (True, False):
+            with self.subTest(has_trades=has_trades), redirect_stdout(StringIO()), \
+                 patch.object(app, 'ROOT_DIR', root), \
+                 patch.object(app, 'STRATEGY_NAME', 'test'), \
+                 patch.dict(app.STRATEGY_REGISTRY, {'test': AlwaysSignalStrategy}), \
+                 patch.object(app, 'load_data', return_value=frame), \
+                 patch.object(app, 'run_rolling_window_backtest', return_value=pd.DataFrame()) as rolling, \
+                 patch.object(app.MonteCarloFTMO, 'run_simulation', return_value={'p_pass': 0}) as mc, \
+                 patch.object(app, 'log_experiment', return_value='regression'), \
+                 patch.object(app, 'save_report_and_trades') as save, \
+                 patch.object(AlwaysSignalStrategy, 'generate_signal',
+                              autospec=True, side_effect=AlwaysSignalStrategy.generate_signal if has_trades else lambda *args: None):
+                app.main()
+                rolling.assert_called_once()
+                save.assert_called_once()
+                metrics = save.call_args.args[3]
+                if has_trades:
+                    self.assertIn('Max Total', metrics['first_fail_reason'])
+                    mc.assert_called_once()
+                else:
+                    mc.assert_not_called()
+                    self.assertEqual(metrics['monte_carlo']['status'], 'skipped')
+                self.assertTrue((root / 'reports/test/regression_rolling_windows.csv').exists())
 
     def test_monte_carlo_requires_dates_and_preserves_real_days(self):
         mc = MonteCarloFTMO(self.ftmo_path, block_days=2)

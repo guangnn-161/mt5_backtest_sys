@@ -80,19 +80,11 @@ def main():
 
     if not trade_history:
         print("[!] Backtest không sinh ra lệnh nào. Hãy kiểm tra lại logic Strategy.")
-        return
 
     # 5. Phân tích kết quả chuẩn MT5
     metrics = generate_mt5_report(trade_history)
     print(
         f"[*] Kết quả thô: Lợi nhuận {metrics.get('net_profit', 0)}$ | Winrate: {metrics.get('win_rate_pct', 0)}% | Tổng lệnh: {metrics.get('total_trades', 0)}")
-
-    # 6. Chạy phòng giả lập Monte Carlo
-    print("[*] Đang chạy Monte Carlo (10,000 kịch bản)...")
-    mc = MonteCarloFTMO(ROOT_DIR / "configs" / "ftmo_rules.yaml")
-    mc_metrics = mc.run_simulation(
-        df_trades[['exit_time', 'pnl_pct']], n_sims=10000)
-    print(f"[*] Xác suất Pass FTMO (p_pass): {mc_metrics['p_pass']}%")
 
     # 7. Rolling-window: rủi ro chế độ thị trường, độc lập với Monte Carlo reshuffle.
     print("[*] Đang chạy Rolling-window Robustness Test (30 ngày, bước 5 ngày)...")
@@ -107,10 +99,29 @@ def main():
     rolling_metrics = summarize(rolling_results)
     print(f"[*] Rolling Window: {rolling_metrics}")
 
+    # Monte Carlo is optional when no trades exist; rolling always runs first.
+    mc_metrics = {"status": "skipped", "reason": "no_trades"}
+    if trade_history:
+        print("[*] Đang chạy Monte Carlo (10,000 kịch bản)...")
+        mc = MonteCarloFTMO(ROOT_DIR / "configs" / "ftmo_rules.yaml")
+        mc_metrics = mc.run_simulation(
+            df_trades[['exit_time', 'pnl_pct']], n_sims=10000)
+        mc_metrics["source_scope"] = "full_simulation_including_post_failure"
+        print(f"[*] Monte Carlo p_pass: {mc_metrics['p_pass']}%")
+
     # 8. Ghi Log và Lưu Báo cáo tự động theo tên chiến lược
     combined_metrics = {
         **metrics,
         "initial_balance": guard.initial_balance,
+        "simulation_scope": "full_history_including_post_failure",
+        "first_fail_time": (
+            str(df_trades.attrs['first_fail_time'])
+            if df_trades.attrs.get('first_fail_time') is not None else None
+        ),
+        "first_fail_reason": df_trades.attrs.get('first_fail_reason'),
+        "post_failure_trades": sum(
+            bool(trade.get('post_failure_entry', False)) for trade in trade_history
+        ),
         "monte_carlo": mc_metrics,
         "rolling_window": rolling_metrics,
     }
