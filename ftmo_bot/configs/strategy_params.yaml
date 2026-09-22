@@ -14,5 +14,6 @@ sessions:
     start: '14:30'
     end: '23:59'
 momentum_params:
-  placeholder_lookback: 14
-  placeholder_threshold: 1.5
+  body_threshold: 2.0
+  stop_distance: 5.0
+  target_distance: 10.0

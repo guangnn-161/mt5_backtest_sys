@@ -16,18 +16,20 @@ def run_rolling_window_backtest(
     risk_params_path: Path,
     window_days: int = 30,
     step_days: int = 5,
+    warmup_bars: int = 300,
 ) -> pd.DataFrame:
     """
     Chạy backtest độc lập tại nhiều điểm bắt đầu khác nhau trong lịch sử.
     Mỗi window mô phỏng: "nếu FTMO Challenge của tôi bắt đầu đúng ngày này thì sao?"
 
     Trả về DataFrame, mỗi dòng là kết quả của một window:
-    start_date, end_date, outcome ('pass'/'fail_daily'/'fail_dd'/'timeout'),
+    start_date, end_date, outcome
+    ('pass'/'fail_daily'/'fail_total'/'internal_stop'/'timeout'),
     days_to_result, max_dd_in_window_pct, num_trades
     """
     
-    if window_days <= 0 or step_days <= 0:
-        raise ValueError("window_days và step_days phải lớn hơn 0")
+    if window_days <= 0 or step_days <= 0 or warmup_bars < 0:
+        raise ValueError("window_days/step_days must be positive and warmup_bars non-negative")
 
     df = df.sort_values('time').reset_index(drop=True).copy()
     df['date_only'] = pd.to_datetime(df['time']).dt.date
@@ -45,28 +47,35 @@ def run_rolling_window_backtest(
         if window_end_day > unique_days[-1]:
             break
 
-        window_df = df[
-            (df['date_only'] >= window_start_day) & (
-                df['date_only'] <= window_end_day)
-        ].drop(columns=['date_only'])
+        window_mask = (
+            (df['date_only'] >= window_start_day)
+            & (df['date_only'] <= window_end_day)
+        )
+        window_positions = df.index[window_mask]
+        window_df = df.loc[window_mask].drop(columns=['date_only'])
 
         if len(window_df) < 50:  # quá ít dữ liệu (window cuối bị cắt cụt) -> bỏ qua
             break
 
-        # Mỗi window cần instance MỚI hoàn toàn — tránh rò rỉ trạng thái (balance, peak...)
-        # giữa các lần chạy
+        # Include history only to initialise causal indicators and state. The engine
+        # explicitly forbids orders before the first bar of the test window.
+        context_start = max(0, int(window_positions[0]) - warmup_bars)
+        context_end = int(window_positions[-1])
+        context_df = df.iloc[context_start:context_end + 1].drop(
+            columns=['date_only']
+        )
+
         guard = ComplianceGuard(ftmo_rules_path, risk_params_path)
         risk_mgr = RiskManager(risk_params_path)
         strategy = strategy_factory()
-        # Chỉ báo phải được tính riêng trong window để không rò rỉ trạng thái
-        # từ các ngày đứng trước thời điểm giả lập Challenge.
-        window_df = strategy.prepare_data(window_df.copy())
+        context_df = strategy.prepare_data(context_df.copy())
 
         engine = BacktestEngine(
-            df=window_df,
+            df=context_df,
             strategy=strategy,
             risk_manager=risk_mgr,
             compliance_guard=guard,
+            trading_start_time=window_df.iloc[0]['time'],
         )
         trades = engine.run()
 
@@ -96,6 +105,11 @@ def run_rolling_window_backtest(
             "days_to_result": days_to_result,
             "max_dd_in_window_pct": max_dd_pct,
             "num_trades": len(trades_to_result),
+            "num_trades_full_simulation": len(trades),
+            "post_failure_trades": (
+                int(trades['post_failure_entry'].sum()) if not trades.empty else 0
+            ),
+            "ending_balance_full_simulation": trades.attrs['ending_balance'],
         })
 
         start_idx += step_days
@@ -118,11 +132,25 @@ def _classify_outcome(trades: pd.DataFrame, guard: ComplianceGuard, start_day, e
             pass_time = target_hits.iloc[0]['exit_time']
 
     fail_time = trades.attrs.get('first_fail_time')
-    if pass_time is not None and (fail_time is None or pass_time <= fail_time):
+    internal_stop_time = trades.attrs.get('first_internal_stop_time')
+    if (
+        pass_time is not None
+        and (fail_time is None or pass_time < fail_time)
+        and (internal_stop_time is None or pass_time < internal_stop_time)
+    ):
         return "pass", (pass_time.date() - start_day).days, pass_time
 
     if fail_time is not None:
-        return "fail", (fail_time.date() - start_day).days, fail_time
+        reason = trades.attrs.get('first_fail_reason', '')
+        fail_type = "fail_daily" if "Daily" in reason else "fail_total"
+        return fail_type, (fail_time.date() - start_day).days, fail_time
+
+    if internal_stop_time is not None:
+        return (
+            "internal_stop",
+            (internal_stop_time.date() - start_day).days,
+            internal_stop_time,
+        )
 
     return "timeout", (end_day - start_day).days, None
 
@@ -130,9 +158,9 @@ def _classify_outcome(trades: pd.DataFrame, guard: ComplianceGuard, start_day, e
 def _compute_max_dd_pct(equity_curve: pd.DataFrame, initial_balance: float):
     if equity_curve is None or equity_curve.empty:
         return None
-    running_max = equity_curve['equity'].cummax()
-    dd = (equity_curve['equity'] - running_max) / initial_balance * 100
-    return float(dd.min())
+    running_max = equity_curve['equity'].cummax().clip(lower=initial_balance)
+    dd = (running_max - equity_curve['equity']) / running_max * 100
+    return float(dd.max())
 
 
 def summarize(results: pd.DataFrame) -> dict:
@@ -143,11 +171,14 @@ def summarize(results: pd.DataFrame) -> dict:
     n = len(results)
     pass_mask = results['outcome'] == 'pass'
     median_days = results.loc[pass_mask, 'days_to_result'].median()
-    worst_dd = results['max_dd_in_window_pct'].min()
+    worst_dd = results['max_dd_in_window_pct'].max()
+    fail_mask = results['outcome'].str.startswith('fail')
+    internal_mask = results['outcome'] == 'internal_stop'
     return {
         "num_windows": n,
         "p_pass_across_history": round(float(pass_mask.sum() / n * 100), 2),
-        "p_fail_across_history": round(float((results['outcome'] == 'fail').sum() / n * 100), 2),
+        "p_fail_across_history": round(float(fail_mask.sum() / n * 100), 2),
+        "p_internal_stop_across_history": round(float(internal_mask.sum() / n * 100), 2),
         "p_timeout_across_history": round(float((results['outcome'] == 'timeout').sum() / n * 100), 2),
         "worst_max_dd_pct": round(float(worst_dd), 2) if pd.notna(worst_dd) else None,
         "median_days_to_pass": float(median_days) if pd.notna(median_days) else None,
