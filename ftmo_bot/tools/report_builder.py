@@ -161,10 +161,10 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     esc = lambda value: escape(str(value))
     pf = '∞' if m.get('profit_factor_status') == 'no_losses' and m['gross_profit'] > 0 else fmt(m.get('profit_factor'))
     dd = (m.get('equity_drawdown') or {}).get('relative_pct')
-    unconstrained = m.get('unconstrained_path') or {}
+    constrained = m.get('ftmo_constrained_path') or {}
     kpis = [
-        ('FTMO-constrained profit', fmt(m['net_profit']), meta.get('currency', 'USD') + ' · stops new entries only after FTMO hard breach', 'positive' if m['net_profit'] >= 0 else 'negative'),
-        ('No-loss-constraint profit', fmt(unconstrained.get('net_profit')), meta.get('currency', 'USD') + ' · independent full-history path', 'positive' if (unconstrained.get('net_profit') or 0) >= 0 else 'negative'),
+        ('No-loss-constraint profit', fmt(m['net_profit']), meta.get('currency', 'USD') + ' · full-history primary result', 'positive' if m['net_profit'] >= 0 else 'negative'),
+        ('FTMO-constrained profit', fmt(constrained.get('net_profit')), meta.get('currency', 'USD') + ' · shown for comparison and Monte Carlo', 'positive' if (constrained.get('net_profit') or 0) >= 0 else 'negative'),
         ('Profit factor', pf, 'Net winning / net losing trades', ''),
         ('Equity drawdown', fmt(dd, 'pct'), 'Largest peak-to-trough decline', 'negative'),
         ('Win rate', fmt(m['win_rate_pct'], 'pct'), f'{m["total_trades"]:,} constrained-path closed trades', ''),
@@ -182,9 +182,9 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
         ('Strategy', esc(strategy)), ('Symbol / timeframe', esc(meta.get('symbol', 'N/A')) + ' / ' + esc(meta.get('timeframe', 'N/A'))),
         ('Period from', esc(meta.get('period_start', 'N/A'))), ('Period to', esc(meta.get('period_end', 'N/A'))),
         ('OHLC bars', fmt(meta.get('bars'), 'int')), ('Initial deposit', fmt(m['initial_balance'])),
-        ('Constrained ending balance', fmt(m['ending_balance'])), ('Constrained ending equity', fmt(m['ending_equity'])),
-        ('Unconstrained ending balance', fmt(unconstrained.get('ending_balance'))),
-        ('Unconstrained closed trades', fmt(unconstrained.get('total_trades'), 'int')),
+        ('No-loss-constraint ending balance', fmt(m['ending_balance'])), ('No-loss-constraint ending equity', fmt(m['ending_equity'])),
+        ('FTMO-constrained ending balance', fmt(constrained.get('ending_balance'))),
+        ('FTMO-constrained closed trades', fmt(constrained.get('total_trades'), 'int')),
         ('Report timezone', esc(meta.get('report_timezone', 'UTC'))), ('Source commit', esc(meta.get('git_commit', 'N/A'))),
     ])
     unavailable = table('Data & execution coverage', [
@@ -205,7 +205,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
         ('Fail total loss', fmt(mc.get('p_fail_max_dd'), 'pct')), ('Timeout', fmt(mc.get('p_timeout'), 'pct')),
         ('95th percentile DD', fmt(mc.get('max_dd_p95'), 'pct')), ('Average days to pass', fmt(mc.get('avg_days_to_pass'))),
         ('Method', esc(mc.get('method', 'N/A'))),
-    ]) + table('Rolling-window · fresh account each start', [
+    ]) + table('Rolling-window · no loss constraint', [
         ('Status', rolling_status),
         ('Windows', fmt(rolling.get('num_windows', 0), 'int')),
         ('Pass across windows', fmt(rolling.get('p_pass_across_history'), 'pct')),
@@ -223,29 +223,29 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
         ('Status', esc(walk_forward.get('status', 'completed'))),
     ]) + '</div>'
     methodology = '''<div class="panel pad method">
-<p><strong>Two-path scope.</strong> The teal FTMO-constrained path and orange no-loss-constraint path are separate fresh simulations from the same data, strategy parameters and execution model. The constrained path stops opening new positions after a daily- or total-loss hard breach. The orange path ignores only those two loss gates and continues through the complete history; it still has its own compounding, position sizing and execution costs. No hard breach does not by itself mean the challenge passed.</p>
+<p><strong>Two-path scope.</strong> Performance tables, trade ledger, trade charts, daily/monthly returns, rolling windows and walk-forward results use the no-loss-constraint path. It is a fresh full-history simulation that ignores only FTMO daily- and total-loss gates while retaining compounding, position sizing and execution costs. The teal equity line is the separate FTMO-constrained comparison path, which stops new entries after a hard breach. Monte Carlo is deliberately calculated from that constrained path.</p>
 <p><strong>Drawdowns.</strong> Positive peak-to-trough values include the initial deposit as a starting peak. Cash-maximal and percentage-relative drawdowns can occur at different times. Equity and balance are sampled at bar close; intrabar compliance checks can detect a breach that is not visible in these sampled drawdowns.</p>
 <p><strong>Ratios.</strong> Sharpe uses daily equity returns, zero risk-free rate, sample standard deviation and √252 annualization. Sortino uses the root mean square of negative daily returns (target zero). Only dates present in the equity series enter these statistics; missing dates are not fabricated. These are documented research estimates, not a claim of numerical identity with the native MT5 tester.</p>
 <p><strong>Trade statistics.</strong> AHPR is the mean trade growth factor; GHPR is its geometric mean. Net P/L includes recorded costs. Gross profit/loss split net trades by sign. Recovery uses net profit / maximal sampled equity drawdown. Streaks break on a zero-P/L trade; runs testing excludes zero trades. LR uses initial plus closed-trade balances versus trade index, with n−2 residual degrees of freedom. Holding time is timestamp-based and has bar-level precision.</p>
 <p><strong>Availability.</strong> N/A means insufficient observations, an undefined denominator, or a field the engine does not record. The profit-factor card uses ∞ for positive profit with no losses; JSON stores null with an explicit status. No MT5 history-quality percentage, tick count, margin figure, swap or MFE/MAE value is invented.</p>
-<p><strong>Robustness.</strong> Monte Carlo resamples observed day blocks from the constrained ledger; it does not reconstruct intratrade floating losses. Overlapping rolling windows are not independent samples. Monthly returns use sampled month-end equity; first/last months may be partial. Costs and source timezones are preserved in the configuration snapshot.</p>
+<p><strong>Robustness.</strong> Monte Carlo resamples observed day blocks from the FTMO-constrained ledger; it does not reconstruct intratrade floating losses. Rolling and walk-forward use no-loss-constraint fresh-account simulations. Overlapping rolling windows are not independent samples. Monthly returns use sampled month-end equity; first/last months may be partial. Costs and source timezones are preserved in the configuration snapshot.</p>
 <p>Reference: <a href="https://www.metatrader5.com/en/terminal/help/algotrading/testing_report">MetaTrader 5 tester report field reference</a>. This report is produced by the Python research engine.</p>
 '''
     methodology += '<details><summary>Configuration snapshot</summary><pre>' + esc(json.dumps(clean_json(config), ensure_ascii=False, indent=2)) + '</pre></details></div>'
     sections = [
         section(1, 'Run overview', 'Inputs, account and measurement coverage', '<div class="two">'+profile+unavailable+'</div>', 'overview'),
-        section(2, 'Performance statistics', 'Amounts in '+str(meta.get('currency', 'USD')), perf, 'performance'),
-        section(3, 'Equity & risk', 'Full historical path', image_tag(images[0])+notice+'<div style="height:18px"></div>'+risk+'<div style="height:18px"></div>'+image_tag(images[1]), 'risk'),
-        section(4, 'Trade anatomy', 'Distribution, sequences and timing', image_tag(images[2])+'<div style="height:18px"></div>'+streak+'<div style="height:18px"></div>'+image_tag(images[3]), 'trades'),
-        section(5, 'Monthly performance', 'Equity returns by calendar month', image_tag(images[4]), 'calendar'),
+        section(2, 'Performance statistics', 'No-loss-constraint path · amounts in '+str(meta.get('currency', 'USD')), perf, 'performance'),
+        section(3, 'Equity & risk', 'Teal = FTMO-constrained comparison · orange and risk statistics = no-loss constraint', image_tag(images[0])+notice+'<div style="height:18px"></div>'+risk+'<div style="height:18px"></div>'+image_tag(images[1]), 'risk'),
+        section(4, 'Trade anatomy', 'No-loss-constraint path', image_tag(images[2])+'<div style="height:18px"></div>'+streak+'<div style="height:18px"></div>'+image_tag(images[3]), 'trades'),
+        section(5, 'Monthly performance', 'No-loss-constraint equity returns by calendar month', image_tag(images[4]), 'calendar'),
         section(6, 'Robustness laboratory', 'Rolling windows & empirical Monte Carlo', robustness+'<div style="height:18px"></div>'+image_tag(images[5])+'<div style="height:18px"></div>'+image_tag(images[6]), 'robustness'),
-        section(7, 'Trade ledger', 'Complete history in trades.csv · times retain source timezone', '<details class="panel pad"><summary>Expand latest 200 closed trades</summary>' + ledger_html(trades) + '</details>', 'ledger'),
+        section(7, 'Trade ledger', 'No-loss-constraint history in trades.csv · times retain source timezone', '<details class="panel pad"><summary>Expand latest 200 closed trades</summary>' + ledger_html(trades) + '</details>', 'ledger'),
         section(8, 'Definitions & reproducibility', 'Documented assumptions', methodology, 'methods'),
     ]
     css = (Path(__file__).parent / 'templates/report.css').read_text(encoding='utf-8')
     demo = '<div class="demo">SYNTHETIC DEMO — layout preview only; not actual strategy results.</div>' if meta.get('is_demo') else ''
     nav = ''.join(f'<a href="#{anchor}">{title}</a>' for anchor,title in [('overview','Overview'),('performance','Statistics'),('risk','Equity & risk'),('trades','Trades'),('calendar','Monthly'),('robustness','Robustness'),('ledger','Ledger'),('methods','Methodology')])
-    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','FTMO-constrained trades'),('equity_curve.csv','FTMO-constrained equity'),('trades_unconstrained.csv','No-loss-constraint trades'),('equity_curve_unconstrained.csv','No-loss-constraint equity'),('rolling_windows.csv','Rolling windows'),('walk_forward.csv','Walk-forward windows'),('daily_returns.csv','Daily returns'),('monthly_returns.csv','Monthly returns')])
+    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','No-loss-constraint trades'),('equity_curve.csv','FTMO-constrained equity'),('trades_constrained.csv','FTMO-constrained trades'),('equity_curve_unconstrained.csv','No-loss-constraint equity'),('rolling_windows.csv','No-loss rolling windows'),('walk_forward.csv','No-loss walk-forward windows'),('daily_returns.csv','No-loss daily returns'),('monthly_returns.csv','No-loss monthly returns')])
     return f'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(strategy)} · Backtest research report</title><style>{css}</style></head><body><main class="shell">
 <div class="masthead"><div class="brand">QUANT / RESEARCH</div><div class="edition">STRATEGY TESTER REPORT · {esc(meta['created_at'])}</div></div>{demo}
 <header class="hero"><div class="eyebrow">Systematic trading · performance dossier</div><h1>{esc(strategy.upper())}</h1><p>{esc(meta.get('symbol','N/A'))} · {esc(meta.get('timeframe','N/A'))} &nbsp; / &nbsp; {esc(meta.get('period_start','N/A'))} → {esc(meta.get('period_end','N/A'))}</p>
@@ -281,43 +281,47 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
         raise FileExistsError('Cannot allocate a unique run report directory')
     attrs = df_trades.attrs if df_trades is not None else {}
     unconstrained_attrs = unconstrained_df_trades.attrs if unconstrained_df_trades is not None else {}
-    trades = pd.DataFrame(trade_history)
-    if trades.empty:
-        trades = pd.DataFrame(columns=TRADE_COLUMNS)
-    curve = attrs.get('equity_curve', pd.DataFrame(columns=['time','balance','equity','is_failed'])).copy()
+    constrained_trades = pd.DataFrame(trade_history)
+    if constrained_trades.empty:
+        constrained_trades = pd.DataFrame(columns=TRADE_COLUMNS)
+    constrained_curve = attrs.get('equity_curve', pd.DataFrame(columns=['time','balance','equity','is_failed'])).copy()
     unconstrained_trades = (pd.DataFrame(unconstrained_df_trades)
                             if unconstrained_df_trades is not None else pd.DataFrame(columns=TRADE_COLUMNS))
     unconstrained_curve = unconstrained_attrs.get(
         'equity_curve', pd.DataFrame(columns=['time', 'balance', 'equity', 'is_failed'])
     ).copy()
+    # Legacy/demo callers may not provide a second path. In that case their sole
+    # path remains the report's primary result.
+    trades = unconstrained_trades if unconstrained_df_trades is not None else constrained_trades
+    result_curve = unconstrained_curve if not unconstrained_curve.empty else constrained_curve
     if rolling_results is None or rolling_results.empty:
         rolling_results = pd.DataFrame(columns=ROLLING_COLUMNS)
     if walk_forward_results is None or walk_forward_results.empty:
         walk_forward_results = pd.DataFrame(columns=WALK_FORWARD_COLUMNS)
-    initial = metrics.get('initial_balance') or attrs.get('initial_balance')
+    initial = metrics.get('initial_balance') or attrs.get('initial_balance') or unconstrained_attrs.get('initial_balance')
     if initial is None:
         raise ValueError('Reports require initial_balance; it is never inferred as $10,000')
     source_tz, report_tz = meta.get('source_timezone', 'UTC'), meta.get('report_timezone', 'UTC')
-    full_metrics = {**metrics, **calculate_metrics(trade_history, initial, curve, source_tz, report_tz)}
+    full_metrics = {**metrics, **calculate_metrics(trades.to_dict('records'), initial, result_curve, source_tz, report_tz)}
     for key in ['first_fail_time','first_fail_reason','first_internal_stop_time','first_internal_stop_reason']:
         meta[key] = attrs.get(key, meta.get(key))
-    meta.setdefault('bars', len(curve))
-    meta.setdefault('period_start', str(curve.time.iloc[0]) if len(curve) else 'N/A')
-    meta.setdefault('period_end', str(curve.time.iloc[-1]) if len(curve) else 'N/A')
-    daily = daily_equity(curve, initial, source_tz, report_tz)
+    meta.setdefault('bars', len(result_curve))
+    meta.setdefault('period_start', str(result_curve.time.iloc[0]) if len(result_curve) else 'N/A')
+    meta.setdefault('period_end', str(result_curve.time.iloc[-1]) if len(result_curve) else 'N/A')
+    daily = daily_equity(result_curve, initial, source_tz, report_tz)
     monthly = monthly_returns(daily, initial)
-    images = render_charts(folder / 'images', trades, curve, daily, monthly, rolling_results,
+    images = render_charts(folder / 'images', trades, constrained_curve, daily, monthly, rolling_results,
                            full_metrics, meta, unconstrained_curve=unconstrained_curve)
     payload = {'schema_version': 1, 'run_id': run_id, 'strategy': strategy_name,
                'metadata': meta, 'metrics': full_metrics, 'configuration': config,
                'artifacts': ['report.html', 'report.json', 'trades.csv', 'equity_curve.csv',
-                             'trades_unconstrained.csv', 'equity_curve_unconstrained.csv',
+                             'trades_constrained.csv', 'equity_curve_unconstrained.csv',
                              'rolling_windows.csv', 'walk_forward.csv', 'daily_returns.csv', 'monthly_returns.csv']
                             + ['images/' + p.name for p in images]}
     (folder / 'report.json').write_text(json.dumps(clean_json(payload), ensure_ascii=False,
                                                 indent=2, allow_nan=False), encoding='utf-8')
-    for name, frame in [('trades',trades),('equity_curve',curve),
-                        ('trades_unconstrained', unconstrained_trades),
+    for name, frame in [('trades',trades),('equity_curve',constrained_curve),
+                        ('trades_constrained', constrained_trades),
                         ('equity_curve_unconstrained', unconstrained_curve),
                         ('rolling_windows',rolling_results),
                         ('walk_forward',walk_forward_results),

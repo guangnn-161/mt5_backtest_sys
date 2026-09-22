@@ -98,8 +98,11 @@ class ArtifactTests(unittest.TestCase):
         trades, curve = sample()
         unconstrained = trades.copy()
         unconstrained_curve = curve.copy()
-        unconstrained_curve['equity'] += 25
-        unconstrained_curve['balance'] += 25
+        unconstrained['pnl_usd'] = 50.
+        unconstrained['balance'] = 1000 + unconstrained['pnl_usd'].cumsum()
+        unconstrained['pnl_pct'] = unconstrained['pnl_usd'] / (unconstrained['balance'] - unconstrained['pnl_usd']) * 100
+        unconstrained_curve['equity'] = unconstrained['balance'].to_numpy()
+        unconstrained_curve['balance'] = unconstrained['balance'].to_numpy()
         unconstrained.attrs.update(equity_curve=unconstrained_curve, initial_balance=1000)
         with tempfile.TemporaryDirectory() as temp:
             kwargs = dict(reports_root=temp, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -109,7 +112,7 @@ class ArtifactTests(unittest.TestCase):
                                      unconstrained_df_trades=unconstrained, **kwargs)
             payload = json.loads((folder/'report.json').read_text())
             html = (folder/'report.html').read_text()
-            self.assertEqual(payload['metrics']['net_profit'], 200)
+            self.assertEqual(payload['metrics']['net_profit'], 250)
             self.assertEqual(len(list((folder/'images').glob('*.png'))), 7)
             self.assertEqual(html.count('src="data:image/png;base64,'), 7)
             self.assertNotIn('<script>bad()', html)
@@ -120,8 +123,10 @@ class ArtifactTests(unittest.TestCase):
             eq = pd.read_csv(folder/'equity_curve.csv')
             self.assertEqual(eq.balance.iloc[-1], 1200)
             self.assertEqual(len(pd.read_csv(folder/'trades.csv')), 5)
-            self.assertEqual(len(pd.read_csv(folder/'trades_unconstrained.csv')), 5)
-            self.assertEqual(pd.read_csv(folder/'equity_curve_unconstrained.csv').equity.iloc[-1], 1225)
+            self.assertEqual(pd.read_csv(folder/'trades.csv').pnl_usd.iloc[0], 50)
+            self.assertEqual(len(pd.read_csv(folder/'trades_constrained.csv')), 5)
+            self.assertEqual(pd.read_csv(folder/'trades_constrained.csv').pnl_usd.iloc[0], 100)
+            self.assertEqual(pd.read_csv(folder/'equity_curve_unconstrained.csv').equity.iloc[-1], 1250)
             self.assertEqual(len(pd.read_csv(folder/'rolling_windows.csv')), 0)
             original = (folder/'report.html').read_bytes()
             other = save_run_report('momentum', 'run_other', [], {'initial_balance':1000}, **kwargs)

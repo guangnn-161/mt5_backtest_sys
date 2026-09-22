@@ -86,17 +86,18 @@ def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metad
         fig.autofmt_xdate(rotation=15)
     paths.append(save(fig, folder / '01_equity_balance.png'))
 
-    fig, (ax,) = figure('Drawdown profile', 'Peak-to-trough decline · initial deposit included in the running peak')
-    if curve.empty:
+    result_curve = unconstrained_curve if unconstrained_curve is not None and not unconstrained_curve.empty else curve
+    fig, (ax,) = figure('Drawdown profile', 'No-loss-constraint path · peak-to-trough decline · initial deposit included in the running peak')
+    if result_curve.empty:
         empty(ax, 'No equity observations')
     else:
-        peak = curve.equity.cummax().clip(lower=initial)
-        dd = (peak - curve.equity) / peak * 100
-        ax.fill_between(pd.to_datetime(curve.time), -dd, 0, color=RED, alpha=.17)
-        ax.plot(pd.to_datetime(curve.time), -dd, color=RED, lw=1.25, label='Equity drawdown')
-        if 'balance' in curve:
-            bp = curve.balance.cummax().clip(lower=initial)
-            ax.plot(pd.to_datetime(curve.time), -(bp - curve.balance) / bp * 100,
+        peak = result_curve.equity.cummax().clip(lower=initial)
+        dd = (peak - result_curve.equity) / peak * 100
+        ax.fill_between(pd.to_datetime(result_curve.time), -dd, 0, color=RED, alpha=.17)
+        ax.plot(pd.to_datetime(result_curve.time), -dd, color=RED, lw=1.25, label='No-loss equity drawdown')
+        if 'balance' in result_curve:
+            bp = result_curve.balance.cummax().clip(lower=initial)
+            ax.plot(pd.to_datetime(result_curve.time), -(bp - result_curve.balance) / bp * 100,
                     color=NAVY, lw=.9, label='Balance drawdown')
         ax.set_ylabel('Drawdown (%)', color=MUTED, fontsize=9)
         ax.legend(frameon=False, fontsize=8)
@@ -158,7 +159,7 @@ def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metad
                     ax.text(j, i, f'{matrix[i, j]:+.1f}%', ha='center', va='center', fontsize=9, color=NAVY)
     paths.append(save(fig, folder / '05_monthly_returns.png'))
 
-    fig, axes = figure('Rolling-window robustness', 'Each window starts with a fresh account · constrained path ends at an FTMO hard breach', cols=2)
+    fig, axes = figure('Rolling-window robustness', 'Each window starts with a fresh no-loss-constraint account', cols=2)
     if rolling is None or rolling.empty:
         for ax in axes:
             empty(ax, 'No complete rolling windows in this dataset')

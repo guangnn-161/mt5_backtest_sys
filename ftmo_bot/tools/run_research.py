@@ -125,12 +125,12 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
     trades, strategy = run_path(enforce_limits=True)
     unconstrained_trades, _ = run_path(enforce_limits=False)
     risk = RiskManager(risk_params)
-    history = trades.to_dict('records') if not trades.empty else []
-    metrics = generate_mt5_report(
-        history, guard.initial_balance, trades.attrs['equity_curve'],
+    constrained_history = trades.to_dict('records') if not trades.empty else []
+    constrained_metrics = generate_mt5_report(
+        constrained_history, guard.initial_balance, trades.attrs['equity_curve'],
         guard.ftmo_rules.get('data_timezone', 'UTC'), guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
     )
-    unconstrained_metrics = generate_mt5_report(
+    metrics = generate_mt5_report(
         unconstrained_trades.to_dict('records') if not unconstrained_trades.empty else [],
         guard.initial_balance, unconstrained_trades.attrs['equity_curve'],
         guard.ftmo_rules.get('data_timezone', 'UTC'), guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
@@ -143,10 +143,11 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
             df=raw_df, strategy_factory=lambda: strategy_class(dict(params)),
             ftmo_rules_path=ftmo_rules, risk_params_path=risk_params,
             window_days=rolling['window_days'], step_days=rolling['step_days'], warmup_bars=rolling['warmup_bars'],
+            enforce_limits=False,
         )
         rolling_metrics = summarize(rolling_results)
     mc_metrics = {'status': 'disabled'}
-    if config['monte_carlo']['enabled'] and history:
+    if config['monte_carlo']['enabled'] and constrained_history:
         mc_metrics = MonteCarloFTMO(BOT_ROOT / 'configs' / 'ftmo_rules.yaml').run_simulation(
             trades[['exit_time', 'pnl_pct']], n_sims=config['monte_carlo']['n_sims']
         )
@@ -160,17 +161,18 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
             train_days=walk_forward['train_days'], test_days=walk_forward['test_days'],
             step_days=walk_forward['step_days'], warmup_bars=walk_forward['warmup_bars'],
             parameter_grid=(walk_forward.get('parameter_grids') or {}).get(strategy_name, {}),
+            enforce_limits=False,
         )
         walk_forward_metrics = summarize_walk_forward(walk_forward_results)
     return trades, unconstrained_trades, {
         **metrics, 'initial_balance': guard.initial_balance,
-        'simulation_scope': 'ftmo_constrained_until_hard_breach',
+        'simulation_scope': 'no_loss_constraint_full_history',
         'first_fail_time': str(trades.attrs['first_fail_time']) if trades.attrs.get('first_fail_time') is not None else None,
         'first_fail_reason': trades.attrs.get('first_fail_reason'),
         'post_failure_trades': 0,
         'monte_carlo': mc_metrics, 'rolling_window': rolling_metrics,
         'walk_forward': walk_forward_metrics,
-        'unconstrained_path': unconstrained_metrics,
+        'ftmo_constrained_path': constrained_metrics,
     }, rolling_results, walk_forward_results, strategy, guard, risk
 
 

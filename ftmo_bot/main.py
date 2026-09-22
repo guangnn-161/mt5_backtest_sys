@@ -119,22 +119,22 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
     print('[*] Running paired FTMO-constrained and no-loss-constraint backtests...')
     df_trades, strategy_instance = run_path(enforce_limits=True)
     unconstrained_trades, _ = run_path(enforce_limits=False)
-    trade_history = df_trades.to_dict('records') if not df_trades.empty else []
-    if not trade_history:
+    constrained_history = df_trades.to_dict('records') if not df_trades.empty else []
+    if not constrained_history:
         print('[!] No orders were generated.')
 
-    metrics = generate_mt5_report(
-        trade_history, guard.initial_balance, df_trades.attrs['equity_curve'],
+    constrained_metrics = generate_mt5_report(
+        constrained_history, guard.initial_balance, df_trades.attrs['equity_curve'],
         guard.ftmo_rules.get('data_timezone', 'UTC'),
         guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
     )
-    unconstrained_metrics = generate_mt5_report(
+    metrics = generate_mt5_report(
         unconstrained_trades.to_dict('records') if not unconstrained_trades.empty else [],
         guard.initial_balance, unconstrained_trades.attrs['equity_curve'],
         guard.ftmo_rules.get('data_timezone', 'UTC'),
         guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
     )
-    print('[*] Raw result: P/L {net_profit:.2f}$ | Win rate: {win_rate_pct:.2f}% | Trades: {total_trades}'.format(**metrics))
+    print('[*] No-loss-constraint result: P/L {net_profit:.2f}$ | Win rate: {win_rate_pct:.2f}% | Trades: {total_trades}'.format(**metrics))
 
     print('[*] Running rolling-window robustness test (30 days, step 5 days)...')
     rolling_results = run_rolling_window_backtest(
@@ -144,11 +144,12 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
         risk_params_path=ROOT_DIR / 'configs' / 'risk_params.yaml',
         window_days=30,
         step_days=5,
+        enforce_limits=False,
     )
     rolling_metrics = summarize(rolling_results)
 
     mc_metrics = {'status': 'skipped', 'reason': 'no_trades'}
-    if trade_history:
+    if constrained_history:
         print('[*] Running Monte Carlo (10,000 simulations)...')
         mc = MonteCarloFTMO(ROOT_DIR / 'configs' / 'ftmo_rules.yaml')
         mc_metrics = mc.run_simulation(df_trades[['exit_time', 'pnl_pct']], n_sims=10000)
@@ -157,19 +158,19 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
     combined_metrics = {
         **metrics,
         'initial_balance': guard.initial_balance,
-        'simulation_scope': 'ftmo_constrained_until_hard_breach',
+        'simulation_scope': 'no_loss_constraint_full_history',
         'first_fail_time': (str(df_trades.attrs['first_fail_time'])
                             if df_trades.attrs.get('first_fail_time') is not None else None),
         'first_fail_reason': df_trades.attrs.get('first_fail_reason'),
         'post_failure_trades': 0,
-        'unconstrained_path': unconstrained_metrics,
+        'ftmo_constrained_path': constrained_metrics,
         'monte_carlo': mc_metrics,
         'rolling_window': rolling_metrics,
     }
     run_id = log_experiment(params=strat_params, metrics=combined_metrics,
                             notes=f'Automatic run for strategy {strategy_name}')
     report_dir = save_report_and_trades(
-        strategy_name, run_id, trade_history, combined_metrics, df_trades,
+        strategy_name, run_id, constrained_history, combined_metrics, df_trades,
         unconstrained_df_trades=unconstrained_trades,
         rolling_results=rolling_results,
         reports_root=ROOT_DIR / 'reports',

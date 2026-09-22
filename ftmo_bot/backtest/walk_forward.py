@@ -19,6 +19,7 @@ def run_rolling_window_backtest(
     window_days: int = 30,
     step_days: int = 5,
     warmup_bars: int = 300,
+    enforce_limits: bool = True,
 ) -> pd.DataFrame:
     """
     Chạy backtest độc lập tại nhiều điểm bắt đầu khác nhau trong lịch sử.
@@ -78,9 +79,9 @@ def run_rolling_window_backtest(
             risk_manager=risk_mgr,
             compliance_guard=guard,
             trading_start_time=window_df.iloc[0]['time'],
-            # Rolling windows answer the FTMO-constrained challenge question.
-            # The published hard limits, rather than an internal buffer, end entries.
+            # Callers choose whether a robustness window uses FTMO limits.
             continue_after_failure=False,
+            enforce_limits=enforce_limits,
             enforce_internal_stop=False,
         )
         trades = engine.run()
@@ -230,7 +231,7 @@ def _context_for_window(df, start_position, end_position, warmup_bars):
 
 
 def _run_window(df, start_position, end_position, strategy_class, params,
-                ftmo_rules, risk_params, warmup_bars):
+                ftmo_rules, risk_params, warmup_bars, enforce_limits=True):
     context, trading_start = _context_for_window(df, start_position, end_position, warmup_bars)
     strategy = strategy_class(dict(params))
     prepared = strategy.prepare_data(context)
@@ -238,6 +239,7 @@ def _run_window(df, start_position, end_position, strategy_class, params,
         prepared, strategy, RiskManager(risk_params), ComplianceGuard(ftmo_rules, risk_params),
         trading_start_time=trading_start,
         continue_after_failure=False,
+        enforce_limits=enforce_limits,
         enforce_internal_stop=False,
     )
     return engine.run()
@@ -251,11 +253,12 @@ def run_walk_forward_backtest(
     risk_params: dict | Path,
     *, train_days: int = 180, test_days: int = 30, step_days: int = 30,
     warmup_bars: int = 300, parameter_grid: dict | None = None,
+    enforce_limits: bool = True,
 ) -> pd.DataFrame:
     """Chronological train-select-test evaluation with no test-period parameter use.
 
-    The chosen candidate is the best *non-hard-breaching* configuration by
-    train net P/L; any hard breach ranks below a non-breaching candidate. Test
+    With FTMO limits enabled, a non-hard-breaching candidate ranks above a
+    breached one; without them candidates rank only by train net P/L. Test
     windows are fresh account simulations and never feed back into selection.
     """
     if min(train_days, test_days, step_days) <= 0 or warmup_bars < 0:
@@ -282,13 +285,13 @@ def run_walk_forward_backtest(
         scored = []
         for params in candidates:
             trades = _run_window(frame, int(train_positions[0]), int(train_positions[-1]),
-                                 strategy_class, params, ftmo_rules, risk_params, warmup_bars)
+                                 strategy_class, params, ftmo_rules, risk_params, warmup_bars, enforce_limits)
             pnl = float(trades.pnl_usd.sum()) if not trades.empty else 0.0
             breached = trades.attrs.get('first_fail_time') is not None
             scored.append((not breached, pnl, params, trades))
         _, train_pnl, selected_params, train_trades = max(scored, key=lambda item: (item[0], item[1]))
         test_trades = _run_window(frame, int(test_positions[0]), int(test_positions[-1]),
-                                  strategy_class, selected_params, ftmo_rules, risk_params, warmup_bars)
+                                  strategy_class, selected_params, ftmo_rules, risk_params, warmup_bars, enforce_limits)
         test_pnl = float(test_trades.pnl_usd.sum()) if not test_trades.empty else 0.0
         results.append({
             'train_start': train_start, 'train_end': train_end,
