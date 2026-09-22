@@ -107,3 +107,18 @@ Run `python ftmo_bot/tools/demo_report.py` to generate a deterministic synthetic
 layout preview under `reports/demo_momentum/`. The HTML labels the data as a
 synthetic demonstration. It does not alter real market data or the experiment
 log.
+
+## Batch strategy runner
+
+`python ftmo_bot/main.py` automatically discovers every concrete class whose
+name ends in `Strategy` in `ftmo_bot/strategy/` and runs them serially over the
+same raw dataset. No `STRATEGY_NAME` switch or manually maintained strategy list
+is required. Each strategy has a fresh engine, risk manager, compliance guard,
+rolling-window test, Monte Carlo run and timestamped report directory. A failure
+in one strategy is printed in the batch summary and does not prevent the other
+strategies from running.
+
+An optional `configs/<strategy-name>_params.yaml` overrides the shared
+`configs/strategy_params.yaml` for that one strategy. The automatic name is the
+class name with the `Strategy` suffix removed and lower-cased: for example,
+`TripleMomentumStrategy` uses `triplemomentum_params.yaml` when present.

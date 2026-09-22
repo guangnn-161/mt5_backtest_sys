@@ -292,8 +292,7 @@ class IntegrityTests(unittest.TestCase):
         for has_trades in (True, False):
             with self.subTest(has_trades=has_trades), redirect_stdout(StringIO()), \
                  patch.object(app, 'ROOT_DIR', root), \
-                 patch.object(app, 'STRATEGY_NAME', 'test'), \
-                 patch.dict(app.STRATEGY_REGISTRY, {'test': AlwaysSignalStrategy}), \
+                 patch.object(app, 'discover_strategies', return_value={'test': AlwaysSignalStrategy}), \
                  patch.object(app, 'load_data', return_value=frame), \
                  patch.object(app, 'run_rolling_window_backtest', return_value=pd.DataFrame()) as rolling, \
                  patch.object(app.MonteCarloFTMO, 'run_simulation', return_value={'p_pass': 0}) as mc, \
@@ -313,6 +312,11 @@ class IntegrityTests(unittest.TestCase):
                     self.assertEqual(metrics['monte_carlo']['status'], 'skipped')
                 self.assertIn('rolling_results', save.call_args.kwargs)
                 self.assertEqual(save.call_args.kwargs['reports_root'], root / 'reports')
+
+    def test_main_discovers_all_strategies_without_name_configuration(self):
+        import main as app
+        discovered = app.discover_strategies()
+        self.assertEqual(set(discovered), {'momentum', 'simplersi', 'triplemomentum'})
 
     def test_monte_carlo_requires_dates_and_preserves_real_days(self):
         mc = MonteCarloFTMO(self.ftmo_path, block_days=2)
