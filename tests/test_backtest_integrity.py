@@ -334,7 +334,36 @@ class IntegrityTests(unittest.TestCase):
     def test_main_discovers_all_strategies_without_name_configuration(self):
         import main as app
         discovered = app.discover_strategies()
-        self.assertEqual(set(discovered), {'momentum', 'simplersi', 'triplemomentum'})
+        self.assertEqual(set(discovered), {
+            'momentum', 'simplersi', 'triplemomentum',
+            'no1', 'no2', 'no3', 'no4', 'no5', 'no6', 'no7', 'no8', 'no9', 'no10',
+        })
+
+    def test_candidate_strategies_prepare_without_future_data_or_invalid_orders(self):
+        import main as app
+        frame = pd.DataFrame({
+            'time': pd.date_range('2026-01-01', periods=160, freq='5min'),
+            'open': [100 + index * .03 for index in range(160)],
+            'high': [101 + index * .03 for index in range(160)],
+            'low': [99 + index * .03 for index in range(160)],
+            'close': [100.2 + index * .03 for index in range(160)],
+        })
+        candidates = {name: klass for name, klass in app.discover_strategies().items() if name.startswith('no')}
+        self.assertEqual(len(candidates), 10)
+        for name, klass in candidates.items():
+            with self.subTest(name=name):
+                strategy = klass({})
+                prepared = strategy.prepare_data(frame.copy())
+                for row in prepared.iloc[-20:].itertuples():
+                    signal = strategy.generate_signal(row)
+                    if signal is not None:
+                        self.assertIn(signal['type'], {'BUY', 'SELL'})
+                        if signal['type'] == 'BUY':
+                            self.assertLess(signal['sl'], signal['entry'])
+                            self.assertGreater(signal['tp'], signal['entry'])
+                        else:
+                            self.assertGreater(signal['sl'], signal['entry'])
+                            self.assertLess(signal['tp'], signal['entry'])
 
     def test_monte_carlo_requires_dates_and_preserves_real_days(self):
         mc = MonteCarloFTMO(self.ftmo_path, block_days=2)
