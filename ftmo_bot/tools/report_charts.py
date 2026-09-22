@@ -10,7 +10,7 @@ from matplotlib.colors import TwoSlopeNorm
 
 from tools.backtest_metrics import local_times
 
-TEAL, ORANGE, RED, NAVY = '#087f8c', '#e89938', '#cf5360', '#182b43'
+TEAL, ORANGE, RED, NAVY, PURPLE = '#087f8c', '#e89938', '#cf5360', '#182b43', '#7856a3'
 MUTED, GRID = '#6b7c8e', '#e4eaf0'
 OUTCOMES = {'pass': TEAL, 'fail_daily': RED, 'fail_total': '#933f52',
             'internal_stop': ORANGE, 'timeout': '#a9b5c3'}
@@ -49,6 +49,27 @@ def save(fig, path):
     return Path(path)
 
 
+def pnl_from_recorded_limit(curve):
+    """Return a zero-based P/L series from the first recorded account limit.
+
+    The engine persists flags from the bar where a hard breach or an internal
+    safety stop was detected. The chart uses bar-close equity, so the origin is
+    the recorded limit bar rather than an invented intrabar fill price.
+    """
+    hard = curve.get('hard_breach', curve.get('is_failed',
+                                               pd.Series(False, index=curve.index)))
+    internal = curve.get('internal_stop', pd.Series(False, index=curve.index))
+    hard = hard.astype(bool).to_numpy()
+    internal = internal.astype(bool).to_numpy()
+    if hard.any():
+        first = int(np.flatnonzero(hard)[0])
+        return first, curve.equity.iloc[first:] - curve.equity.iloc[first], 'hard breach', ORANGE
+    if internal.any():
+        first = int(np.flatnonzero(internal)[0])
+        return first, curve.equity.iloc[first:] - curve.equity.iloc[first], 'internal stop', PURPLE
+    return None
+
+
 def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metadata):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -57,7 +78,7 @@ def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metad
     tz = metadata.get('report_timezone', 'UTC')
     source_tz = metadata.get('source_timezone', 'UTC')
     currency = metadata.get('currency', 'USD')
-    fig, (ax,) = figure('Capital trajectory', 'Bar-close equity and balance · orange = post-failure research simulation')
+    fig, (ax,) = figure('Capital trajectory', 'Bar-close equity and balance · right axis = P/L from the recorded limit bar')
     if curve.empty:
         empty(ax, 'No equity observations')
     else:
@@ -73,7 +94,27 @@ def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metad
         if 'balance' in curve:
             ax.plot(times, curve.balance, color=NAVY, lw=.85, alpha=.65, label='Balance')
         ax.axhline(initial, color=MUTED, ls='--', lw=.8, label='Initial deposit')
-        ax.legend(loc='lower left', bbox_to_anchor=(0, 1.01), ncol=5, frameon=False, fontsize=8)
+
+        limit_pnl = pnl_from_recorded_limit(curve)
+        if limit_pnl is not None:
+            first, pnl, label, colour = limit_pnl
+            pnl_ax = ax.twinx()
+            pnl_ax.spines['top'].set_visible(False)
+            pnl_ax.spines['right'].set_color(colour)
+            pnl_ax.tick_params(axis='y', colors=colour, labelsize=9)
+            pnl_ax.axhline(0, color=colour, ls=':', lw=.8, alpha=.75)
+            pnl_line = pnl_ax.plot(times.iloc[first:], pnl, color=colour, lw=1.45,
+                                   ls='--', label=f'P/L since {label}')[0]
+            pnl_ax.set_ylabel(f'P/L since limit ({currency})', color=colour, fontsize=9)
+            money_axis(pnl_ax)
+            handles, labels = ax.get_legend_handles_labels()
+            handles.append(pnl_line)
+            labels.append(pnl_line.get_label())
+            ax.legend(handles, labels, loc='lower left', bbox_to_anchor=(0, 1.01),
+                      ncol=5, frameon=False, fontsize=8)
+        else:
+            ax.legend(loc='lower left', bbox_to_anchor=(0, 1.01), ncol=5,
+                      frameon=False, fontsize=8)
         money_axis(ax)
         ax.set_ylabel(currency, color=MUTED, fontsize=9)
         fig.autofmt_xdate(rotation=15)
