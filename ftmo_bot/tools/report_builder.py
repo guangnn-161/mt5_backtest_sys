@@ -161,26 +161,30 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     esc = lambda value: escape(str(value))
     pf = '∞' if m.get('profit_factor_status') == 'no_losses' and m['gross_profit'] > 0 else fmt(m.get('profit_factor'))
     dd = (m.get('equity_drawdown') or {}).get('relative_pct')
+    unconstrained = m.get('unconstrained_path') or {}
     kpis = [
-        ('Net profit', fmt(m['net_profit']), meta.get('currency', 'USD') + ' · full simulation', 'positive' if m['net_profit'] >= 0 else 'negative'),
+        ('FTMO-constrained profit', fmt(m['net_profit']), meta.get('currency', 'USD') + ' · stops new entries only after FTMO hard breach', 'positive' if m['net_profit'] >= 0 else 'negative'),
+        ('No-loss-constraint profit', fmt(unconstrained.get('net_profit')), meta.get('currency', 'USD') + ' · independent full-history path', 'positive' if (unconstrained.get('net_profit') or 0) >= 0 else 'negative'),
         ('Profit factor', pf, 'Net winning / net losing trades', ''),
         ('Equity drawdown', fmt(dd, 'pct'), 'Largest peak-to-trough decline', 'negative'),
-        ('Win rate', fmt(m['win_rate_pct'], 'pct'), f'{m["total_trades"]:,} closed trades', ''),
+        ('Win rate', fmt(m['win_rate_pct'], 'pct'), f'{m["total_trades"]:,} constrained-path closed trades', ''),
     ]
     cards = ''.join(f'<div class="kpi"><label>{esc(k)}</label><strong class="{c}">{v}</strong><small>{esc(note)}</small></div>' for k,v,note,c in kpis)
     perf, risk, streak = metric_tables(m)
     failed = meta.get('first_fail_time') is not None
-    status = 'HARD BREACH · RESEARCH CONTINUED' if failed else ('INTERNAL SAFETY STOP' if meta.get('first_internal_stop_time') else 'NO HARD BREACH RECORDED')
+    status = 'FTMO HARD BREACH · CONSTRAINED PATH HALTED' if failed else 'NO FTMO HARD BREACH RECORDED'
     notice = ''
     if failed:
-        notice = (f'<div class="notice"><strong>First failure: {esc(meta["first_fail_time"])}</strong> · '
-                  f'{esc(meta.get("first_fail_reason", ""))}<br>Orange marks the continued simulation. '
-                  f'{m["post_failure_trades"]:,} positions opened after failure. Later recovery does not reverse the failure.</div>')
+        notice = (f'<div class="notice"><strong>FTMO hard breach: {esc(meta["first_fail_time"])}</strong> · '
+                  f'{esc(meta.get("first_fail_reason", ""))}<br>The teal constrained path opens no new position after this point. '
+                  'The orange path is a separate fresh simulation that ignores daily/total loss limits.</div>')
     profile = table('Run specification', [
         ('Strategy', esc(strategy)), ('Symbol / timeframe', esc(meta.get('symbol', 'N/A')) + ' / ' + esc(meta.get('timeframe', 'N/A'))),
         ('Period from', esc(meta.get('period_start', 'N/A'))), ('Period to', esc(meta.get('period_end', 'N/A'))),
         ('OHLC bars', fmt(meta.get('bars'), 'int')), ('Initial deposit', fmt(m['initial_balance'])),
-        ('Ending balance', fmt(m['ending_balance'])), ('Ending equity', fmt(m['ending_equity'])),
+        ('Constrained ending balance', fmt(m['ending_balance'])), ('Constrained ending equity', fmt(m['ending_equity'])),
+        ('Unconstrained ending balance', fmt(unconstrained.get('ending_balance'))),
+        ('Unconstrained closed trades', fmt(unconstrained.get('total_trades'), 'int')),
         ('Report timezone', esc(meta.get('report_timezone', 'UTC'))), ('Source commit', esc(meta.get('git_commit', 'N/A'))),
     ])
     unavailable = table('Data & execution coverage', [
@@ -194,12 +198,15 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     mc = m.get('monte_carlo', {})
     rolling = m.get('rolling_window', {})
     walk_forward = m.get('walk_forward', {})
+    mc_status = mc.get('status', 'completed')
+    rolling_status = 'no valid complete windows' if rolling.get('num_windows', 0) == 0 else 'completed'
     robustness = '<div class="two">' + table('Monte Carlo · empirical outcomes', [
-        ('Pass', fmt(mc.get('p_pass'), 'pct')), ('Fail daily loss', fmt(mc.get('p_fail_daily_loss'), 'pct')),
+        ('Status', esc(mc_status)), ('Pass', fmt(mc.get('p_pass'), 'pct')), ('Fail daily loss', fmt(mc.get('p_fail_daily_loss'), 'pct')),
         ('Fail total loss', fmt(mc.get('p_fail_max_dd'), 'pct')), ('Timeout', fmt(mc.get('p_timeout'), 'pct')),
         ('95th percentile DD', fmt(mc.get('max_dd_p95'), 'pct')), ('Average days to pass', fmt(mc.get('avg_days_to_pass'))),
         ('Method', esc(mc.get('method', 'N/A'))),
     ]) + table('Rolling-window · fresh account each start', [
+        ('Status', rolling_status),
         ('Windows', fmt(rolling.get('num_windows', 0), 'int')),
         ('Pass across windows', fmt(rolling.get('p_pass_across_history'), 'pct')),
         ('Fail across windows', fmt(rolling.get('p_fail_across_history'), 'pct')),
@@ -216,12 +223,12 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
         ('Status', esc(walk_forward.get('status', 'completed'))),
     ]) + '</div>'
     methodology = '''<div class="panel pad method">
-<p><strong>Scope.</strong> Profit and trade statistics include the complete simulation, including trades after a hard failure. The original failure timestamp stays fixed. Rolling-window outcomes remain separate from the continued path. No hard breach does not by itself mean the challenge passed.</p>
+<p><strong>Two-path scope.</strong> The teal FTMO-constrained path and orange no-loss-constraint path are separate fresh simulations from the same data, strategy parameters and execution model. The constrained path stops opening new positions after a daily- or total-loss hard breach. The orange path ignores only those two loss gates and continues through the complete history; it still has its own compounding, position sizing and execution costs. No hard breach does not by itself mean the challenge passed.</p>
 <p><strong>Drawdowns.</strong> Positive peak-to-trough values include the initial deposit as a starting peak. Cash-maximal and percentage-relative drawdowns can occur at different times. Equity and balance are sampled at bar close; intrabar compliance checks can detect a breach that is not visible in these sampled drawdowns.</p>
 <p><strong>Ratios.</strong> Sharpe uses daily equity returns, zero risk-free rate, sample standard deviation and √252 annualization. Sortino uses the root mean square of negative daily returns (target zero). Only dates present in the equity series enter these statistics; missing dates are not fabricated. These are documented research estimates, not a claim of numerical identity with the native MT5 tester.</p>
 <p><strong>Trade statistics.</strong> AHPR is the mean trade growth factor; GHPR is its geometric mean. Net P/L includes recorded costs. Gross profit/loss split net trades by sign. Recovery uses net profit / maximal sampled equity drawdown. Streaks break on a zero-P/L trade; runs testing excludes zero trades. LR uses initial plus closed-trade balances versus trade index, with n−2 residual degrees of freedom. Holding time is timestamp-based and has bar-level precision.</p>
 <p><strong>Availability.</strong> N/A means insufficient observations, an undefined denominator, or a field the engine does not record. The profit-factor card uses ∞ for positive profit with no losses; JSON stores null with an explicit status. No MT5 history-quality percentage, tick count, margin figure, swap or MFE/MAE value is invented.</p>
-<p><strong>Robustness.</strong> Monte Carlo resamples observed day blocks from the full ledger, including post-failure trades; it does not reconstruct intratrade floating losses. Overlapping rolling windows are not independent samples. Monthly returns use sampled month-end equity; first/last months may be partial. Costs and source timezones are preserved in the configuration snapshot.</p>
+<p><strong>Robustness.</strong> Monte Carlo resamples observed day blocks from the constrained ledger; it does not reconstruct intratrade floating losses. Overlapping rolling windows are not independent samples. Monthly returns use sampled month-end equity; first/last months may be partial. Costs and source timezones are preserved in the configuration snapshot.</p>
 <p>Reference: <a href="https://www.metatrader5.com/en/terminal/help/algotrading/testing_report">MetaTrader 5 tester report field reference</a>. This report is produced by the Python research engine.</p>
 '''
     methodology += '<details><summary>Configuration snapshot</summary><pre>' + esc(json.dumps(clean_json(config), ensure_ascii=False, indent=2)) + '</pre></details></div>'
@@ -238,7 +245,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     css = (Path(__file__).parent / 'templates/report.css').read_text(encoding='utf-8')
     demo = '<div class="demo">SYNTHETIC DEMO — layout preview only; not actual strategy results.</div>' if meta.get('is_demo') else ''
     nav = ''.join(f'<a href="#{anchor}">{title}</a>' for anchor,title in [('overview','Overview'),('performance','Statistics'),('risk','Equity & risk'),('trades','Trades'),('calendar','Monthly'),('robustness','Robustness'),('ledger','Ledger'),('methods','Methodology')])
-    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','All trades'),('equity_curve.csv','Equity & balance'),('rolling_windows.csv','Rolling windows'),('walk_forward.csv','Walk-forward windows'),('daily_returns.csv','Daily returns'),('monthly_returns.csv','Monthly returns')])
+    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','FTMO-constrained trades'),('equity_curve.csv','FTMO-constrained equity'),('trades_unconstrained.csv','No-loss-constraint trades'),('equity_curve_unconstrained.csv','No-loss-constraint equity'),('rolling_windows.csv','Rolling windows'),('walk_forward.csv','Walk-forward windows'),('daily_returns.csv','Daily returns'),('monthly_returns.csv','Monthly returns')])
     return f'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(strategy)} · Backtest research report</title><style>{css}</style></head><body><main class="shell">
 <div class="masthead"><div class="brand">QUANT / RESEARCH</div><div class="edition">STRATEGY TESTER REPORT · {esc(meta['created_at'])}</div></div>{demo}
 <header class="hero"><div class="eyebrow">Systematic trading · performance dossier</div><h1>{esc(strategy.upper())}</h1><p>{esc(meta.get('symbol','N/A'))} · {esc(meta.get('timeframe','N/A'))} &nbsp; / &nbsp; {esc(meta.get('period_start','N/A'))} → {esc(meta.get('period_end','N/A'))}</p>
@@ -249,6 +256,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
 
 
 def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=None, *,
+                    unconstrained_df_trades=None,
                     rolling_results=None, walk_forward_results=None, metadata=None, config=None, reports_root=None, created_at=None):
     meta, config = dict(metadata or {}), dict(config or {})
     timestamp = created_at or datetime.now(timezone.utc)
@@ -272,10 +280,16 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     else:
         raise FileExistsError('Cannot allocate a unique run report directory')
     attrs = df_trades.attrs if df_trades is not None else {}
+    unconstrained_attrs = unconstrained_df_trades.attrs if unconstrained_df_trades is not None else {}
     trades = pd.DataFrame(trade_history)
     if trades.empty:
         trades = pd.DataFrame(columns=TRADE_COLUMNS)
     curve = attrs.get('equity_curve', pd.DataFrame(columns=['time','balance','equity','is_failed'])).copy()
+    unconstrained_trades = (pd.DataFrame(unconstrained_df_trades)
+                            if unconstrained_df_trades is not None else pd.DataFrame(columns=TRADE_COLUMNS))
+    unconstrained_curve = unconstrained_attrs.get(
+        'equity_curve', pd.DataFrame(columns=['time', 'balance', 'equity', 'is_failed'])
+    ).copy()
     if rolling_results is None or rolling_results.empty:
         rolling_results = pd.DataFrame(columns=ROLLING_COLUMNS)
     if walk_forward_results is None or walk_forward_results.empty:
@@ -292,15 +306,20 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     meta.setdefault('period_end', str(curve.time.iloc[-1]) if len(curve) else 'N/A')
     daily = daily_equity(curve, initial, source_tz, report_tz)
     monthly = monthly_returns(daily, initial)
-    images = render_charts(folder / 'images', trades, curve, daily, monthly, rolling_results, full_metrics, meta)
+    images = render_charts(folder / 'images', trades, curve, daily, monthly, rolling_results,
+                           full_metrics, meta, unconstrained_curve=unconstrained_curve)
     payload = {'schema_version': 1, 'run_id': run_id, 'strategy': strategy_name,
                'metadata': meta, 'metrics': full_metrics, 'configuration': config,
                'artifacts': ['report.html', 'report.json', 'trades.csv', 'equity_curve.csv',
+                             'trades_unconstrained.csv', 'equity_curve_unconstrained.csv',
                              'rolling_windows.csv', 'walk_forward.csv', 'daily_returns.csv', 'monthly_returns.csv']
                             + ['images/' + p.name for p in images]}
     (folder / 'report.json').write_text(json.dumps(clean_json(payload), ensure_ascii=False,
                                                 indent=2, allow_nan=False), encoding='utf-8')
-    for name, frame in [('trades',trades),('equity_curve',curve),('rolling_windows',rolling_results),
+    for name, frame in [('trades',trades),('equity_curve',curve),
+                        ('trades_unconstrained', unconstrained_trades),
+                        ('equity_curve_unconstrained', unconstrained_curve),
+                        ('rolling_windows',rolling_results),
                         ('walk_forward',walk_forward_results),
                         ('daily_returns',daily),('monthly_returns',monthly)]:
         frame.to_csv(folder / (name + '.csv'), index=False)

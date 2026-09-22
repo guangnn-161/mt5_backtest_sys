@@ -24,12 +24,16 @@ class BacktestEngine:
         compliance_guard,
         trading_start_time=None,
         continue_after_failure: bool = True,
+        enforce_limits: bool = True,
+        enforce_internal_stop: bool = True,
     ):
         self.df = self._validate_data(df)
         self.strategy = strategy
         self.risk_manager = risk_manager
         self.compliance_guard = compliance_guard
         self.continue_after_failure = continue_after_failure
+        self.enforce_limits = enforce_limits
+        self.enforce_internal_stop = enforce_internal_stop
 
         self.initial_balance = compliance_guard.initial_balance
         self.balance = self.initial_balance
@@ -287,18 +291,18 @@ class BacktestEngine:
                 worst_equity, best_equity = self._intrabar_extreme_equity(open_trade, row)
                 peak_equity = max(peak_equity, best_equity)
 
-                hard_breach, hard_reason = self.compliance_guard.check_hard_violation(
+                hard_breach, hard_reason = (self.compliance_guard.check_hard_violation(
                     worst_equity, daily_start_balance, peak_equity
-                )
+                ) if self.enforce_limits else (False, 'limits disabled'))
                 if hard_breach and first_fail_time is None:
                     first_fail_index = len(trades)
                     first_fail_time = timestamp
                     first_fail_reason = hard_reason
                     trading_halted = True
 
-                internal_stop, internal_reason = self.compliance_guard.check_internal_stop(
+                internal_stop, internal_reason = (self.compliance_guard.check_internal_stop(
                     worst_equity, daily_start_balance, peak_equity
-                )
+                ) if self.enforce_limits and self.enforce_internal_stop else (False, 'internal stop disabled'))
                 if internal_stop and first_internal_stop_time is None:
                     first_internal_stop_time = timestamp
                     first_internal_stop_reason = internal_reason
@@ -319,9 +323,9 @@ class BacktestEngine:
             )
             peak_equity = max(peak_equity, self.equity)
 
-            trading_state = self.compliance_guard.get_trading_state(
+            trading_state = (self.compliance_guard.get_trading_state(
                 self.equity, daily_start_balance, peak_equity
-            )
+            ) if self.enforce_limits else 'safe')
             stress_mode = self.continue_after_failure and first_fail_time is not None
             if trading_state == "critical" and open_trade is not None and not stress_mode:
                 trades.append(
@@ -332,18 +336,18 @@ class BacktestEngine:
                 open_trade = None
                 self.equity = self.balance
 
-            hard_breach, hard_reason = self.compliance_guard.check_hard_violation(
+            hard_breach, hard_reason = (self.compliance_guard.check_hard_violation(
                 min(self.equity, worst_equity), daily_start_balance, peak_equity
-            )
+            ) if self.enforce_limits else (False, 'limits disabled'))
             if hard_breach and first_fail_time is None:
                 first_fail_index = len(trades)
                 first_fail_time = timestamp
                 first_fail_reason = hard_reason
                 trading_halted = True
 
-            internal_stop, internal_reason = self.compliance_guard.check_internal_stop(
+            internal_stop, internal_reason = (self.compliance_guard.check_internal_stop(
                 min(self.equity, worst_equity), daily_start_balance, peak_equity
-            )
+            ) if self.enforce_limits and self.enforce_internal_stop else (False, 'internal stop disabled'))
             if internal_stop and first_internal_stop_time is None:
                 first_internal_stop_time = timestamp
                 first_internal_stop_reason = internal_reason
@@ -396,6 +400,8 @@ class BacktestEngine:
                 "initial_balance": self.initial_balance,
                 "ending_balance": self.balance,
                 "continue_after_failure": self.continue_after_failure,
+                "enforce_limits": self.enforce_limits,
+                "enforce_internal_stop": self.enforce_internal_stop,
             }
         )
         return df_trades

@@ -96,11 +96,17 @@ class MetricTests(unittest.TestCase):
 class ArtifactTests(unittest.TestCase):
     def test_complete_report_exports_standalone_html_and_does_not_overwrite(self):
         trades, curve = sample()
+        unconstrained = trades.copy()
+        unconstrained_curve = curve.copy()
+        unconstrained_curve['equity'] += 25
+        unconstrained_curve['balance'] += 25
+        unconstrained.attrs.update(equity_curve=unconstrained_curve, initial_balance=1000)
         with tempfile.TemporaryDirectory() as temp:
             kwargs = dict(reports_root=temp, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
                           metadata={'symbol':'<script>bad()</script>', 'currency':'USD'})
             folder = save_run_report('momentum', 'run_test', trades.to_dict('records'),
-                                     {'initial_balance':1000}, trades, **kwargs)
+                                     {'initial_balance':1000}, trades,
+                                     unconstrained_df_trades=unconstrained, **kwargs)
             payload = json.loads((folder/'report.json').read_text())
             html = (folder/'report.html').read_text()
             self.assertEqual(payload['metrics']['net_profit'], 200)
@@ -108,11 +114,14 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(html.count('src="data:image/png;base64,'), 7)
             self.assertNotIn('<script>bad()', html)
             self.assertIn('&lt;script&gt;', html)
+            self.assertIn('No-loss-constraint equity', html)
             for artifact in payload['artifacts']:
                 self.assertTrue((folder/artifact).is_file(), artifact)
             eq = pd.read_csv(folder/'equity_curve.csv')
             self.assertEqual(eq.balance.iloc[-1], 1200)
             self.assertEqual(len(pd.read_csv(folder/'trades.csv')), 5)
+            self.assertEqual(len(pd.read_csv(folder/'trades_unconstrained.csv')), 5)
+            self.assertEqual(pd.read_csv(folder/'equity_curve_unconstrained.csv').equity.iloc[-1], 1225)
             self.assertEqual(len(pd.read_csv(folder/'rolling_windows.csv')), 0)
             original = (folder/'report.html').read_bytes()
             other = save_run_report('momentum', 'run_other', [], {'initial_balance':1000}, **kwargs)

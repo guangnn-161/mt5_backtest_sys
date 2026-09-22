@@ -49,7 +49,8 @@ def save(fig, path):
     return Path(path)
 
 
-def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metadata):
+def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metadata,
+                  unconstrained_curve=None):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -57,23 +58,28 @@ def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metad
     tz = metadata.get('report_timezone', 'UTC')
     source_tz = metadata.get('source_timezone', 'UTC')
     currency = metadata.get('currency', 'USD')
-    fig, (ax,) = figure('Capital trajectory', 'Bar-close equity and balance · orange = post-failure research simulation')
+    fig, (ax,) = figure(
+        'Capital trajectory',
+        'Two independent paths from the same signals · teal = FTMO hard-loss constrained · orange = no loss constraint',
+    )
     if curve.empty:
         empty(ax, 'No equity observations')
     else:
         times = pd.to_datetime(curve.time)
-        failed = curve.get('is_failed', pd.Series(False, index=curve.index)).astype(bool).to_numpy()
         values = curve.equity.to_numpy()
-        ax.plot(times, np.where(~failed, values, np.nan), color=TEAL, lw=1.65, label='Equity before failure')
-        if failed.any():
-            first = int(np.flatnonzero(failed)[0])
-            start = max(0, first - 1)
-            ax.plot(times.iloc[start:], values[start:], color=ORANGE, lw=1.65, label='Post-failure simulation')
-            ax.axvline(times.iloc[first], color=RED, ls=':', lw=1.3, label='First hard breach')
+        ax.plot(times, values, color=TEAL, lw=1.65, label='FTMO-constrained equity')
+        if unconstrained_curve is not None and not unconstrained_curve.empty:
+            free_times = pd.to_datetime(unconstrained_curve.time)
+            ax.plot(free_times, unconstrained_curve.equity, color=ORANGE, lw=1.4,
+                    label='No-loss-constraint equity')
+        hard_breach = curve.get('hard_breach', pd.Series(False, index=curve.index)).astype(bool).to_numpy()
+        if hard_breach.any():
+            first = int(np.flatnonzero(hard_breach)[0])
+            ax.axvline(times.iloc[first], color=RED, ls=':', lw=1.3, label='FTMO hard breach')
         if 'balance' in curve:
             ax.plot(times, curve.balance, color=NAVY, lw=.85, alpha=.65, label='Balance')
         ax.axhline(initial, color=MUTED, ls='--', lw=.8, label='Initial deposit')
-        ax.legend(loc='lower left', bbox_to_anchor=(0, 1.01), ncol=5,
+        ax.legend(loc='lower left', bbox_to_anchor=(0, 1.01), ncol=4,
                   frameon=False, fontsize=8)
         money_axis(ax)
         ax.set_ylabel(currency, color=MUTED, fontsize=9)
@@ -152,7 +158,7 @@ def render_charts(folder, trades, curve, daily, monthly, rolling, metrics, metad
                     ax.text(j, i, f'{matrix[i, j]:+.1f}%', ha='center', va='center', fontsize=9, color=NAVY)
     paths.append(save(fig, folder / '05_monthly_returns.png'))
 
-    fig, axes = figure('Rolling-window robustness', 'Each window starts with a fresh account · failure cannot be reversed by later recovery', cols=2)
+    fig, axes = figure('Rolling-window robustness', 'Each window starts with a fresh account · constrained path ends at an FTMO hard breach', cols=2)
     if rolling is None or rolling.empty:
         for ax in axes:
             empty(ax, 'No complete rolling windows in this dataset')

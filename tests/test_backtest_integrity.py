@@ -251,15 +251,33 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual(len(trades), 1)
         self.assertFalse(trades.post_failure_entry.any())
 
-    def test_each_rolling_window_runs_after_total_loss(self):
+    def test_paired_paths_halt_only_the_ftmo_constrained_path(self):
+        frame = self.total_loss_frame()
+        constrained = BacktestEngine(
+            frame, AlwaysSignalStrategy(), RiskManager(self.risk_path),
+            ComplianceGuard(self.ftmo_path, self.risk_path),
+            continue_after_failure=False, enforce_limits=True, enforce_internal_stop=False,
+        ).run()
+        unconstrained = BacktestEngine(
+            frame, AlwaysSignalStrategy(), RiskManager(self.risk_path),
+            ComplianceGuard(self.ftmo_path, self.risk_path),
+            continue_after_failure=False, enforce_limits=False, enforce_internal_stop=False,
+        ).run()
+        self.assertIsNotNone(constrained.attrs['first_fail_time'])
+        self.assertEqual(len(constrained), 1)
+        self.assertIsNone(unconstrained.attrs['first_fail_time'])
+        self.assertGreater(len(unconstrained), len(constrained))
+        self.assertFalse(unconstrained.attrs['equity_curve'].hard_breach.any())
+
+    def test_each_rolling_window_stops_at_total_loss(self):
         frame = self.total_loss_frame(days=4)
         results = run_rolling_window_backtest(
             frame, AlwaysSignalStrategy, self.ftmo_path, self.risk_path,
             window_days=2, step_days=1, warmup_bars=10)
         self.assertEqual(len(results), 3)
         self.assertTrue((results.outcome == 'fail_total').all())
-        self.assertTrue((results.post_failure_trades > 0).all())
-        self.assertTrue((results.num_trades_full_simulation > results.num_trades).all())
+        self.assertTrue((results.post_failure_trades == 0).all())
+        self.assertTrue((results.num_trades_full_simulation == results.num_trades).all())
 
     def test_dashboard_uses_orange_for_entire_post_failure_path(self):
         import matplotlib

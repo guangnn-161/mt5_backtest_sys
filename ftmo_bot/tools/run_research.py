@@ -108,15 +108,31 @@ def safe_id(value: str) -> str:
 
 def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe, config,
                 ftmo_rules, risk_params):
-    """Run exactly one isolated strategy/pair without sharing indicator state."""
+    """Run paired FTMO-constrained and unconstrained paths from fresh state."""
     guard = ComplianceGuard(ftmo_rules, risk_params)
+    def run_path(*, enforce_limits: bool):
+        strategy = strategy_class(dict(params))
+        prepared = strategy.prepare_data(raw_df.copy())
+        engine = BacktestEngine(
+            prepared, strategy, RiskManager(risk_params), ComplianceGuard(ftmo_rules, risk_params),
+            continue_after_failure=False, enforce_limits=enforce_limits,
+            # The constrained path represents the published FTMO hard limits;
+            # internal buffers are research safeguards, not an FTMO breach.
+            enforce_internal_stop=False,
+        )
+        return engine.run(), strategy
+
+    trades, strategy = run_path(enforce_limits=True)
+    unconstrained_trades, _ = run_path(enforce_limits=False)
     risk = RiskManager(risk_params)
-    strategy = strategy_class(dict(params))
-    prepared = strategy.prepare_data(raw_df.copy())
-    trades = BacktestEngine(prepared, strategy, risk, guard).run()
     history = trades.to_dict('records') if not trades.empty else []
     metrics = generate_mt5_report(
         history, guard.initial_balance, trades.attrs['equity_curve'],
+        guard.ftmo_rules.get('data_timezone', 'UTC'), guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
+    )
+    unconstrained_metrics = generate_mt5_report(
+        unconstrained_trades.to_dict('records') if not unconstrained_trades.empty else [],
+        guard.initial_balance, unconstrained_trades.attrs['equity_curve'],
         guard.ftmo_rules.get('data_timezone', 'UTC'), guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
     )
     rolling_results = pd.DataFrame()
@@ -134,7 +150,7 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
         mc_metrics = MonteCarloFTMO(BOT_ROOT / 'configs' / 'ftmo_rules.yaml').run_simulation(
             trades[['exit_time', 'pnl_pct']], n_sims=config['monte_carlo']['n_sims']
         )
-        mc_metrics['source_scope'] = 'full_simulation_including_post_failure'
+        mc_metrics['source_scope'] = 'ftmo_constrained_path'
     walk_forward_results = pd.DataFrame()
     walk_forward_metrics = {'status': 'disabled'}
     walk_forward = config['walk_forward']
@@ -146,14 +162,15 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
             parameter_grid=(walk_forward.get('parameter_grids') or {}).get(strategy_name, {}),
         )
         walk_forward_metrics = summarize_walk_forward(walk_forward_results)
-    return trades, {
+    return trades, unconstrained_trades, {
         **metrics, 'initial_balance': guard.initial_balance,
-        'simulation_scope': 'full_history_including_post_failure',
+        'simulation_scope': 'ftmo_constrained_until_hard_breach',
         'first_fail_time': str(trades.attrs['first_fail_time']) if trades.attrs.get('first_fail_time') is not None else None,
         'first_fail_reason': trades.attrs.get('first_fail_reason'),
-        'post_failure_trades': sum(bool(trade.get('post_failure_entry', False)) for trade in history),
+        'post_failure_trades': 0,
         'monte_carlo': mc_metrics, 'rolling_window': rolling_metrics,
         'walk_forward': walk_forward_metrics,
+        'unconstrained_path': unconstrained_metrics,
     }, rolling_results, walk_forward_results, strategy, guard, risk
 
 
@@ -227,12 +244,13 @@ def run_research(config: dict) -> dict:
                 params = dict(load_strategy_params(name))
                 params.update({'symbol': symbol, 'timeframe': timeframe})
                 risk_params = resolved_risk_params(base_risk, instrument)
-                trades, metrics, rolling_results, walk_forward_results, strategy, guard, risk = execute_job(
+                trades, unconstrained_trades, metrics, rolling_results, walk_forward_results, strategy, guard, risk = execute_job(
                     name, klass, raw_df, params, symbol, timeframe, config, ftmo_rules, risk_params
                 )
                 report_path = save_report_and_trades(
                     name, job_id, trades.to_dict('records'), metrics, trades,
                     rolling_results=rolling_results, walk_forward_results=walk_forward_results, reports_root=run_root,
+                    unconstrained_df_trades=unconstrained_trades,
                     metadata={
                         'symbol': symbol, 'timeframe': timeframe,
                         'currency': guard.ftmo_rules.get('currency', 'USD'), 'bars': len(raw_df),

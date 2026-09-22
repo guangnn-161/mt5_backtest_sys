@@ -102,18 +102,35 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
     guard = ComplianceGuard(ROOT_DIR / 'configs' / 'ftmo_rules.yaml',
                             ROOT_DIR / 'configs' / 'risk_params.yaml')
     risk = RiskManager(ROOT_DIR / 'configs' / 'risk_params.yaml')
-    strategy_instance = strategy_class(dict(strat_params))
-    df = strategy_instance.prepare_data(raw_df.copy())
 
-    print('[*] Running Backtest Engine...')
-    engine = BacktestEngine(df, strategy_instance, risk, guard)
-    df_trades = engine.run()
+    def run_path(*, enforce_limits: bool):
+        strategy = strategy_class(dict(strat_params))
+        prepared = strategy.prepare_data(raw_df.copy())
+        engine = BacktestEngine(
+            prepared, strategy,
+            RiskManager(ROOT_DIR / 'configs' / 'risk_params.yaml'),
+            ComplianceGuard(ROOT_DIR / 'configs' / 'ftmo_rules.yaml', ROOT_DIR / 'configs' / 'risk_params.yaml'),
+            continue_after_failure=False,
+            enforce_limits=enforce_limits,
+            enforce_internal_stop=False,
+        )
+        return engine.run(), strategy
+
+    print('[*] Running paired FTMO-constrained and no-loss-constraint backtests...')
+    df_trades, strategy_instance = run_path(enforce_limits=True)
+    unconstrained_trades, _ = run_path(enforce_limits=False)
     trade_history = df_trades.to_dict('records') if not df_trades.empty else []
     if not trade_history:
         print('[!] No orders were generated.')
 
     metrics = generate_mt5_report(
         trade_history, guard.initial_balance, df_trades.attrs['equity_curve'],
+        guard.ftmo_rules.get('data_timezone', 'UTC'),
+        guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
+    )
+    unconstrained_metrics = generate_mt5_report(
+        unconstrained_trades.to_dict('records') if not unconstrained_trades.empty else [],
+        guard.initial_balance, unconstrained_trades.attrs['equity_curve'],
         guard.ftmo_rules.get('data_timezone', 'UTC'),
         guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
     )
@@ -135,17 +152,17 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
         print('[*] Running Monte Carlo (10,000 simulations)...')
         mc = MonteCarloFTMO(ROOT_DIR / 'configs' / 'ftmo_rules.yaml')
         mc_metrics = mc.run_simulation(df_trades[['exit_time', 'pnl_pct']], n_sims=10000)
-        mc_metrics['source_scope'] = 'full_simulation_including_post_failure'
+        mc_metrics['source_scope'] = 'ftmo_constrained_path'
 
     combined_metrics = {
         **metrics,
         'initial_balance': guard.initial_balance,
-        'simulation_scope': 'full_history_including_post_failure',
+        'simulation_scope': 'ftmo_constrained_until_hard_breach',
         'first_fail_time': (str(df_trades.attrs['first_fail_time'])
                             if df_trades.attrs.get('first_fail_time') is not None else None),
         'first_fail_reason': df_trades.attrs.get('first_fail_reason'),
-        'post_failure_trades': sum(bool(trade.get('post_failure_entry', False))
-                                   for trade in trade_history),
+        'post_failure_trades': 0,
+        'unconstrained_path': unconstrained_metrics,
         'monte_carlo': mc_metrics,
         'rolling_window': rolling_metrics,
     }
@@ -153,6 +170,7 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
                             notes=f'Automatic run for strategy {strategy_name}')
     report_dir = save_report_and_trades(
         strategy_name, run_id, trade_history, combined_metrics, df_trades,
+        unconstrained_df_trades=unconstrained_trades,
         rolling_results=rolling_results,
         reports_root=ROOT_DIR / 'reports',
         metadata={

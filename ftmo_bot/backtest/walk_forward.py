@@ -78,6 +78,10 @@ def run_rolling_window_backtest(
             risk_manager=risk_mgr,
             compliance_guard=guard,
             trading_start_time=window_df.iloc[0]['time'],
+            # Rolling windows answer the FTMO-constrained challenge question.
+            # The published hard limits, rather than an internal buffer, end entries.
+            continue_after_failure=False,
+            enforce_internal_stop=False,
         )
         trades = engine.run()
 
@@ -233,6 +237,8 @@ def _run_window(df, start_position, end_position, strategy_class, params,
     engine = BacktestEngine(
         prepared, strategy, RiskManager(risk_params), ComplianceGuard(ftmo_rules, risk_params),
         trading_start_time=trading_start,
+        continue_after_failure=False,
+        enforce_internal_stop=False,
     )
     return engine.run()
 
