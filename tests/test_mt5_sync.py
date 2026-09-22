@@ -115,6 +115,16 @@ class MT5SyncTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_catalog_reader_explains_missing_symbol_timeframe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = MarketDataStore(Path(temp))
+            try:
+                store.mark_state('XAUUSDm', 'M5', 'ok')
+                with self.assertRaisesRegex(FileNotFoundError, 'XAUUSDm M5'):
+                    store.read_bars('XAUUSD', 'M5')
+            finally:
+                store.close()
+
 
 if __name__ == '__main__':
     unittest.main()

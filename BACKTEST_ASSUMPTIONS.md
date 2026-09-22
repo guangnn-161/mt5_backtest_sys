@@ -150,3 +150,11 @@ candle. It is safe to stop with Ctrl+C and run again: existing partitions are
 deduplicated by UTC candle time and only missing/recent history is requested.
 The first 2010-to-present M1 download across many Market Watch symbols can take
 hours and consume many GB; the catalog lets that initial ingestion be resumed.
+
+`main.py` reads the batch symbol and timeframe from the shared
+`configs/strategy_params.yaml` and loads that pair from the market-data catalog.
+The `symbol` must match the exact broker name stored by MT5, including any
+suffix: set `XAUUSDm`, not `XAUUSD`, when Market Watch exposes `XAUUSDm`.
+The former `data/raw/<symbol>_<timeframe>.csv` location remains only as a
+fallback for legacy experiments. If neither source has the requested pair,
+`main.py` raises an actionable error that tells you to run the sync first.

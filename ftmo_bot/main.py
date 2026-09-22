@@ -23,16 +23,36 @@ from backtest.engine import BacktestEngine
 from risk.risk_manager import RiskManager
 from risk.compliance_guard import ComplianceGuard
 from backtest.walk_forward import run_rolling_window_backtest, summarize
+from tools.market_data_store import MarketDataStore
 
 
 ROOT_DIR = Path(__file__).parent
 sys.path.append(str(ROOT_DIR))
 
 
-def load_data(filepath: Path) -> pd.DataFrame:
-    df = pd.read_csv(filepath)
-    df['time'] = pd.to_datetime(df['time'])
-    return df
+def load_data(symbol: str, timeframe: str) -> pd.DataFrame:
+    """Load the new MT5 lake first, with a backwards-compatible CSV fallback."""
+    timeframe = timeframe.upper()
+    market_root = ROOT_DIR / 'data' / 'market' / 'mt5'
+    legacy_path = ROOT_DIR / 'data' / 'raw' / f'{symbol.lower()}_{timeframe.lower()}.csv'
+    store_error = None
+    if (market_root / 'catalog.sqlite').exists():
+        store = MarketDataStore(market_root)
+        try:
+            return store.read_bars(symbol, timeframe)
+        except FileNotFoundError as error:
+            store_error = error
+        finally:
+            store.close()
+    if legacy_path.exists():
+        df = pd.read_csv(legacy_path)
+        df['time'] = pd.to_datetime(df['time'])
+        return df
+    detail = f' {store_error}' if store_error is not None else ''
+    raise FileNotFoundError(
+        f'No backtest data found for {symbol} {timeframe}. '
+        'Run: python ftmo_bot/tools/download_mt5_data.py.' + detail
+    )
 
 
 def discover_strategies() -> dict[str, type[BaseStrategy]]:
@@ -74,7 +94,8 @@ def load_strategy_params(strategy_name: str) -> dict:
     return params
 
 
-def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df: pd.DataFrame) -> dict:
+def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df: pd.DataFrame,
+                 data_symbol: str, data_timeframe: str) -> dict:
     """Run one isolated strategy and write its own report directory."""
     print(f'\n[>] Strategy [{strategy_name.upper()}]')
     strat_params = load_strategy_params(strategy_name)
@@ -135,8 +156,8 @@ def run_strategy(strategy_name: str, strategy_class: type[BaseStrategy], raw_df:
         rolling_results=rolling_results,
         reports_root=ROOT_DIR / 'reports',
         metadata={
-            'symbol': strat_params.get('symbol', 'N/A'),
-            'timeframe': strat_params.get('timeframe', 'N/A'),
+            'symbol': data_symbol,
+            'timeframe': data_timeframe,
             'currency': guard.ftmo_rules.get('currency', 'USD'),
             'bars': len(raw_df),
             'period_start': str(raw_df.time.min()) if len(raw_df) else 'N/A',
@@ -158,13 +179,18 @@ def main() -> list[dict]:
     strategies = discover_strategies()
     if not strategies:
         raise RuntimeError('No *Strategy subclasses were found in ftmo_bot/strategy')
-    raw_df = load_data(ROOT_DIR / 'data' / 'raw' / 'xauusdm_m5.csv')
-    print(f'[*] Loaded {len(raw_df):,} candles. Running {len(strategies)} strategies: {", ".join(strategies)}')
+    data_params = load_strategy_params('__batch__')
+    data_symbol = str(data_params.get('symbol', '')).strip()
+    data_timeframe = str(data_params.get('timeframe', '')).strip().upper()
+    if not data_symbol or not data_timeframe:
+        raise ValueError('strategy_params.yaml must define symbol and timeframe for the batch data source')
+    raw_df = load_data(data_symbol, data_timeframe)
+    print(f'[*] Loaded {len(raw_df):,} {data_symbol} {data_timeframe} candles. Running {len(strategies)} strategies: {", ".join(strategies)}')
 
     results = []
     for name, strategy_class in strategies.items():
         try:
-            results.append(run_strategy(name, strategy_class, raw_df))
+            results.append(run_strategy(name, strategy_class, raw_df, data_symbol, data_timeframe))
         except Exception as error:
             # A broken strategy must not hide reports from the others.
             print(f'[!] Strategy [{name.upper()}] failed: {type(error).__name__}: {error}')

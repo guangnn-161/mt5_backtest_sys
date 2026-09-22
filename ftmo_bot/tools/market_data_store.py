@@ -175,6 +175,35 @@ class MarketDataStore:
     def _partition_path(self, symbol: str, timeframe: str, year: int, month: int) -> Path:
         return self.bars_root / storage_key(symbol) / timeframe / f'{year:04d}' / f'{month:02d}.parquet'
 
+    def read_bars(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """Load one complete symbol/timeframe history from its catalogued partitions."""
+        rows = self.connection.execute('''
+            SELECT relative_path FROM partitions
+            WHERE symbol=? AND timeframe=? ORDER BY year, month
+        ''', (symbol, timeframe)).fetchall()
+        if not rows:
+            available = self.connection.execute('''
+                SELECT symbol, timeframe FROM sync_state WHERE status='ok'
+                ORDER BY symbol, timeframe LIMIT 12
+            ''').fetchall()
+            examples = ', '.join(f"{row['symbol']} {row['timeframe']}" for row in available)
+            hint = f' Available examples: {examples}.' if examples else ''
+            raise FileNotFoundError(
+                f'No catalogued MT5 data for {symbol} {timeframe}.{hint} '
+                'Run download_mt5_data.py first, or use the exact broker symbol in strategy_params.yaml.'
+            )
+        self._require_pyarrow()
+        frames = []
+        for row in rows:
+            path = self.root / row['relative_path']
+            if not path.exists():
+                raise FileNotFoundError(f'Catalog points to a missing partition: {path}')
+            frame = pd.read_parquet(path, engine='pyarrow')
+            frame['time'] = pd.to_datetime(frame['time'], utc=True)
+            frames.append(frame)
+        bars = pd.concat(frames, ignore_index=True)
+        return bars.drop_duplicates('time', keep='last').sort_values('time').reset_index(drop=True)
+
     def write_bars(self, symbol: str, timeframe: str, raw_frame: pd.DataFrame) -> int:
         """Merge a MT5 response into monthly partitions; return received rows."""
         self._require_pyarrow()

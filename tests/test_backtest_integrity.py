@@ -286,7 +286,7 @@ class IntegrityTests(unittest.TestCase):
         (root / 'configs').mkdir()
         shutil.copy(self.ftmo_path, root / 'configs/ftmo_rules.yaml')
         shutil.copy(self.risk_path, root / 'configs/risk_params.yaml')
-        (root / 'configs/strategy_params.yaml').write_text('{}')
+        (root / 'configs/strategy_params.yaml').write_text('symbol: TEST\ntimeframe: M5\n')
         (root / 'reports/test').mkdir(parents=True)
         # Orchestration uses the real engine; rolling itself is tested above.
         for has_trades in (True, False):
