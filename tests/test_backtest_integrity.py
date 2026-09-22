@@ -38,7 +38,7 @@ class OneShotStrategy:
 
 class AlwaysSignalStrategy:
     def __init__(self, params=None):
-        pass
+        self.params = params or {}
 
     def prepare_data(self, frame):
         return frame
@@ -311,7 +311,8 @@ class IntegrityTests(unittest.TestCase):
                 else:
                     mc.assert_not_called()
                     self.assertEqual(metrics['monte_carlo']['status'], 'skipped')
-                self.assertTrue((root / 'reports/test/regression_rolling_windows.csv').exists())
+                self.assertIn('rolling_results', save.call_args.kwargs)
+                self.assertEqual(save.call_args.kwargs['reports_root'], root / 'reports')
 
     def test_monte_carlo_requires_dates_and_preserves_real_days(self):
         mc = MonteCarloFTMO(self.ftmo_path, block_days=2)

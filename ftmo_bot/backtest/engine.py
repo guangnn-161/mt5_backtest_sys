@@ -375,6 +375,7 @@ class BacktestEngine:
                 {
                     "time": timestamp,
                     "equity": self.equity,
+                    "balance": self.balance,
                     "hard_breach": first_fail_time is not None,
                     "internal_stop": first_internal_stop_time is not None,
                     # Backward-compatible column used by the existing dashboard.

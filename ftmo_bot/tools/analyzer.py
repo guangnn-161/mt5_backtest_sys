@@ -1,68 +1,20 @@
 # File: tools/analyzer.py
-import json
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from tools.backtest_metrics import calculate_metrics
+from tools.report_builder import save_run_report
 
 
-def generate_mt5_report(trade_history: list) -> dict:
-    if not trade_history:
-        return {"total_trades": 0, "net_profit": 0, "win_rate_pct": 0}
-
-    df = pd.DataFrame(trade_history)
-    total_trades = len(df)
-    net_profit = df['pnl_usd'].sum()
-    winning_trades = df[df['pnl_usd'] > 0]
-    win_rate = (len(winning_trades) / total_trades) * \
-        100 if total_trades > 0 else 0
-
-    gross_profit = winning_trades['pnl_usd'].sum()
-    losing_trades = df[df['pnl_usd'] < 0]
-    gross_loss = abs(losing_trades['pnl_usd'].sum())
-
-    profit_factor = (
-        gross_profit / gross_loss) if gross_loss > 0 else float('inf')
-
-    # Tính chuỗi thua liên tiếp dài nhất trong lịch sử backtest thật
-    is_loss = (df['pnl_usd'] < 0).astype(int)
-    streak_id = (is_loss != is_loss.shift()).cumsum()
-    max_consec_losses = int(
-        (is_loss.groupby(streak_id).cumsum() * is_loss).max())
-
-    return {
-        "total_trades": total_trades,
-        "net_profit": round(net_profit, 2),
-        "win_rate_pct": round(win_rate, 2),
-        "profit_factor": round(profit_factor, 2),
-        "max_consecutive_losses_count": max_consec_losses,
-    }
+def generate_mt5_report(trade_history: list, initial_balance=None, equity_curve=None,
+                        source_timezone='UTC', report_timezone='UTC') -> dict:
+    return calculate_metrics(trade_history, initial_balance, equity_curve,
+                             source_timezone, report_timezone)
 
 
-def save_report_and_trades(strategy_name: str, run_id: str, trade_history: list, metrics: dict, df_trades: pd.DataFrame = None):
-    root_dir = Path(__file__).parent.parent
-    report_dir = root_dir / "reports" / strategy_name
-    report_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Lưu file JSON báo cáo
-    report_data = {
-        "run_id": run_id,
-        "metrics": metrics
-    }
-    json_path = report_dir / f"{run_id}_report.json"
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(report_data, f, indent=4, ensure_ascii=False)
-
-    # 2. Lưu file CSV danh sách lệnh
-    if trade_history:
-        csv_path = report_dir / f"{run_id}_trades.csv"
-        pd.DataFrame(trade_history).to_csv(csv_path, index=False)
-
-    # 3. Vẽ Dashboard biểu đồ Equity Curve phân tách trạng thái Fail
-    plot_path = report_dir / f"{run_id}_dashboard.jpg"
-    plot_equity_curve_split(df_trades, metrics, plot_path,
-                            strategy_name.upper(), run_id)
-
-    print(f"[*] Đã lưu toàn bộ báo cáo tại: {report_dir}")
+def save_report_and_trades(strategy_name: str, run_id: str, trade_history: list,
+                          metrics: dict, df_trades: pd.DataFrame = None, **kwargs):
+    return save_run_report(strategy_name, run_id, trade_history, metrics, df_trades, **kwargs)
 
 
 def plot_equity_curve_split(df_trades: pd.DataFrame, metrics: dict, save_path: Path, strategy_name: str, run_id: str):

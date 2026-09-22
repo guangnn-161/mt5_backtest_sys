@@ -1,7 +1,7 @@
 from strategy.simplersi import SimpleRSIStrategy
 from strategy.momentum import MomentumStrategy
 from strategy.triple_momentum import TripleMomentumStrategy
-from tools.experiment_logger import log_experiment
+from tools.experiment_logger import log_experiment, get_git_commit
 from tools.analyzer import generate_mt5_report, save_report_and_trades
 from backtest.monte_carlo import MonteCarloFTMO
 from backtest.engine import BacktestEngine
@@ -82,7 +82,10 @@ def main():
         print("[!] Backtest không sinh ra lệnh nào. Hãy kiểm tra lại logic Strategy.")
 
     # 5. Phân tích kết quả chuẩn MT5
-    metrics = generate_mt5_report(trade_history)
+    metrics = generate_mt5_report(
+        trade_history, guard.initial_balance, df_trades.attrs['equity_curve'],
+        guard.ftmo_rules.get('data_timezone', 'UTC'),
+        guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'))
     print(
         f"[*] Kết quả thô: Lợi nhuận {metrics.get('net_profit', 0)}$ | Winrate: {metrics.get('win_rate_pct', 0)}% | Tổng lệnh: {metrics.get('total_trades', 0)}")
 
@@ -129,13 +132,28 @@ def main():
     run_id = log_experiment(params=strat_params, metrics=combined_metrics,
                             notes=f"Tự động chạy chiến lược {STRATEGY_NAME}")
 
-    # Tự động tạo thư mục và lưu report vào reports/<STRATEGY_NAME>/
-    save_report_and_trades(STRATEGY_NAME, run_id, trade_history, combined_metrics, df_trades)
-    rolling_results.to_csv(
-        ROOT_DIR / "reports" / STRATEGY_NAME / f"{run_id}_rolling_windows.csv",
-        index=False,
+    # Every run gets an exclusive UTC timestamp directory under its strategy.
+    report_dir = save_report_and_trades(
+        STRATEGY_NAME, run_id, trade_history, combined_metrics, df_trades,
+        rolling_results=rolling_results,
+        reports_root=ROOT_DIR / "reports",
+        metadata={
+            "symbol": strat_params.get('symbol', 'N/A'),
+            "timeframe": strat_params.get('timeframe', 'N/A'),
+            "currency": guard.ftmo_rules.get('currency', 'USD'),
+            "bars": len(raw_df),
+            "period_start": str(raw_df.time.min()) if len(raw_df) else 'N/A',
+            "period_end": str(raw_df.time.max()) if len(raw_df) else 'N/A',
+            "source_timezone": guard.ftmo_rules.get('data_timezone', 'UTC'),
+            "report_timezone": guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
+            "git_commit": get_git_commit(),
+        },
+        config={"strategy": strategy.params, "ftmo_rules": guard.ftmo_rules,
+                "risk": risk.risk_params,
+                "rolling": {"window_days": 30, "step_days": 5, "warmup_bars": 300},
+                "monte_carlo": {"n_sims": 10000, "seed": 42, "block_days": 5}},
     )
-    print(
-        f"[*] Hoàn tất! Báo cáo, dữ liệu lệnh và Dashboard đã lưu tại: reports/{STRATEGY_NAME}/")
+    print(f"[*] Hoàn tất! Mở báo cáo: {report_dir / 'report.html'}")
+
 if __name__ == "__main__":
     main()
