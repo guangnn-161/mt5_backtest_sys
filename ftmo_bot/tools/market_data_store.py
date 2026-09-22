@@ -87,6 +87,7 @@ class MarketDataStore:
                 first_utc TEXT NOT NULL,
                 last_utc TEXT NOT NULL,
                 updated_at_utc TEXT NOT NULL,
+                content_sha256 TEXT,
                 PRIMARY KEY (symbol, timeframe, year, month)
             );
             CREATE TABLE IF NOT EXISTS sync_errors (
@@ -98,6 +99,10 @@ class MarketDataStore:
                 message TEXT NOT NULL
             );
         ''')
+        # Existing lakes created before data fingerprints were added remain usable.
+        columns = {row['name'] for row in self.connection.execute('PRAGMA table_info(partitions)')}
+        if 'content_sha256' not in columns:
+            self.connection.execute('ALTER TABLE partitions ADD COLUMN content_sha256 TEXT')
         self.connection.commit()
 
     def close(self) -> None:
@@ -175,12 +180,73 @@ class MarketDataStore:
     def _partition_path(self, symbol: str, timeframe: str, year: int, month: int) -> Path:
         return self.bars_root / storage_key(symbol) / timeframe / f'{year:04d}' / f'{month:02d}.parquet'
 
-    def read_bars(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        """Load one complete symbol/timeframe history from its catalogued partitions."""
+    def available_pairs(self) -> list[dict[str, Any]]:
+        """Return all successful symbol/timeframe histories in the lake."""
         rows = self.connection.execute('''
-            SELECT relative_path FROM partitions
-            WHERE symbol=? AND timeframe=? ORDER BY year, month
-        ''', (symbol, timeframe)).fetchall()
+            SELECT symbol, timeframe, first_utc, last_utc, rows
+            FROM sync_state WHERE status='ok' ORDER BY symbol, timeframe
+        ''').fetchall()
+        return [dict(row) for row in rows]
+
+    def _partition_rows(self, symbol: str, timeframe: str, start=None, end=None):
+        """Find partitions overlapping an inclusive time interval."""
+        clauses = ['symbol=?', 'timeframe=?']
+        parameters: list[Any] = [symbol, timeframe]
+        if start is not None:
+            clauses.append('last_utc>=?')
+            parameters.append(iso_utc(start))
+        if end is not None:
+            clauses.append('first_utc<=?')
+            parameters.append(iso_utc(end))
+        return self.connection.execute(
+            'SELECT relative_path, rows, first_utc, last_utc, content_sha256 '
+            'FROM partitions WHERE ' + ' AND '.join(clauses) + ' ORDER BY year, month',
+            parameters,
+        ).fetchall()
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def data_snapshot(self, symbol: str, timeframe: str, *, start=None, end=None) -> dict[str, Any]:
+        """Describe the exact immutable-looking data slice used by a research job.
+
+        A snapshot is content-addressed from the selected Parquet partitions. If a
+        partition changes after a sync, its hash changes and a later run cannot be
+        mistaken for the earlier one.
+        """
+        rows = self._partition_rows(symbol, timeframe, start, end)
+        if not rows:
+            raise FileNotFoundError(f'No catalogued MT5 data for {symbol} {timeframe}')
+        partitions = []
+        for row in rows:
+            path = self.root / row['relative_path']
+            if not path.exists():
+                raise FileNotFoundError(f'Catalog points to a missing partition: {path}')
+            digest = row['content_sha256'] or self._sha256(path)
+            partitions.append({
+                'path': row['relative_path'], 'rows': row['rows'],
+                'first_utc': row['first_utc'], 'last_utc': row['last_utc'],
+                'sha256': digest,
+            })
+        payload = {
+            'schema_version': 1, 'symbol': symbol, 'timeframe': timeframe,
+            'requested_start_utc': iso_utc(start) if start is not None else None,
+            'requested_end_utc': iso_utc(end) if end is not None else None,
+            'partitions': partitions,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        ).hexdigest()
+        return {**payload, 'fingerprint': fingerprint}
+
+    def read_bars(self, symbol: str, timeframe: str, *, start=None, end=None) -> pd.DataFrame:
+        """Load one complete or time-bounded symbol/timeframe history."""
+        rows = self._partition_rows(symbol, timeframe, start, end)
         if not rows:
             available = self.connection.execute('''
                 SELECT symbol, timeframe FROM sync_state WHERE status='ok'
@@ -202,7 +268,12 @@ class MarketDataStore:
             frame['time'] = pd.to_datetime(frame['time'], utc=True)
             frames.append(frame)
         bars = pd.concat(frames, ignore_index=True)
-        return bars.drop_duplicates('time', keep='last').sort_values('time').reset_index(drop=True)
+        bars = bars.drop_duplicates('time', keep='last').sort_values('time').reset_index(drop=True)
+        if start is not None:
+            bars = bars[bars['time'] >= pd.Timestamp(start)].reset_index(drop=True)
+        if end is not None:
+            bars = bars[bars['time'] <= pd.Timestamp(end)].reset_index(drop=True)
+        return bars
 
     def write_bars(self, symbol: str, timeframe: str, raw_frame: pd.DataFrame) -> int:
         """Merge a MT5 response into monthly partitions; return received rows."""
@@ -226,16 +297,18 @@ class MarketDataStore:
             temporary = path.with_suffix('.tmp.parquet')
             merged.to_parquet(temporary, engine='pyarrow', index=False)
             temporary.replace(path)
+            content_sha256 = self._sha256(path)
             relative = path.relative_to(self.root).as_posix()
             self.connection.execute('''
-                INSERT INTO partitions(symbol, timeframe, year, month, relative_path, rows, first_utc, last_utc, updated_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO partitions(symbol, timeframe, year, month, relative_path, rows, first_utc, last_utc, updated_at_utc, content_sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, timeframe, year, month) DO UPDATE SET
                     relative_path=excluded.relative_path, rows=excluded.rows,
                     first_utc=excluded.first_utc, last_utc=excluded.last_utc,
-                    updated_at_utc=excluded.updated_at_utc
+                    updated_at_utc=excluded.updated_at_utc, content_sha256=excluded.content_sha256
             ''', (symbol, timeframe, int(year), int(month), relative, len(merged),
-                  iso_utc(merged.time.iloc[0]), iso_utc(merged.time.iloc[-1]), iso_utc(utc_now())))
+                  iso_utc(merged.time.iloc[0]), iso_utc(merged.time.iloc[-1]), iso_utc(utc_now()),
+                  content_sha256))
 
         state = self.connection.execute('''
             SELECT MIN(first_utc) AS first_utc, MAX(last_utc) AS last_utc, SUM(rows) AS rows

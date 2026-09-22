@@ -158,3 +158,41 @@ suffix: set `XAUUSDm`, not `XAUUSD`, when Market Watch exposes `XAUUSDm`.
 The former `data/raw/<symbol>_<timeframe>.csv` location remains only as a
 fallback for legacy experiments. If neither source has the requested pair,
 `main.py` raises an actionable error that tells you to run the sync first.
+
+## Parquet research platform
+
+`main.py` remains a quick single-pair smoke test. The scalable workflow is:
+
+1. `python ftmo_bot/tools/download_mt5_data.py` — sync Market Watch data into
+   the Parquet lake.
+2. `python ftmo_bot/tools/run_research.py` — run all selected strategy ×
+   symbol × timeframe jobs from `configs/research.yaml`.
+
+The default research configuration selects every successful pair recorded in
+the lake catalog and every automatically discovered strategy. It runs the
+existing rolling challenge windows independently for each job. This is a
+historical robustness test at many starting dates, **not** parameter
+optimization or a train/test walk-forward optimizer; no result is presented as
+out-of-sample optimization evidence yet.
+
+Each research invocation creates one directory such as:
+
+`ftmo_bot/reports/research/research_20260922T021530Z_ab12cd34/`
+
+It contains `manifest.json`, `summary.csv`, and (when `pyarrow` is installed)
+`summary.parquet`; child folders contain the existing detailed strategy
+reports. The manifest and `reports/research/catalog/research.sqlite` preserve
+the selected jobs, source Git commit, configuration, result paths and errors.
+
+Every job records a `data_fingerprint`: a SHA-256 fingerprint of the exact
+monthly Parquet partitions and requested time interval. A report can therefore
+be tied to the actual data slice it consumed, even when the lake later receives
+more history or a corrected partition. `start_utc` and `end_utc` in
+`research.yaml` can restrict a research run to a historical interval without
+copying the data to CSV.
+
+Keep Monte Carlo disabled for a full grid by default: thousands of simulations
+per strategy/pair are expensive and are best run later only on selected
+candidates. Change the filters and `max_jobs` in `research.yaml` to make a
+small, safe first run before launching a complete Market Watch × 21-timeframe
+batch.
