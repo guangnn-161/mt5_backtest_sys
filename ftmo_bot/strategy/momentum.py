@@ -3,6 +3,9 @@ from strategy.base import BaseStrategy
 
 
 class MomentumStrategy(BaseStrategy):
+    # Fixed absolute-price thresholds make this baseline XAUUSD-specific.
+    supported_asset_classes = ('metal',)
+    supported_timeframes = ('M5',)
     def __init__(self, params: dict):
         super().__init__(params)
         self.symbol = params.get('symbol', 'XAUUSDm')

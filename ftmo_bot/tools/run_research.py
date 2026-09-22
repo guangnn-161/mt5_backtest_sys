@@ -27,7 +27,8 @@ if str(BOT_ROOT) not in sys.path:
 
 from backtest.engine import BacktestEngine
 from backtest.monte_carlo import MonteCarloFTMO
-from backtest.walk_forward import run_rolling_window_backtest, summarize
+from backtest.walk_forward import (run_rolling_window_backtest, run_walk_forward_backtest,
+                                   summarize, summarize_walk_forward)
 from main import discover_strategies, load_strategy_params
 from risk.compliance_guard import ComplianceGuard
 from risk.risk_manager import RiskManager
@@ -35,6 +36,9 @@ from tools.analyzer import generate_mt5_report, save_report_and_trades
 from tools.experiment_logger import get_git_commit
 from tools.market_data_store import MarketDataStore, iso_utc
 from tools.research_catalog import ResearchCatalog
+from tools.data_quality import validate_bars
+from tools.research_profiles import (load_yaml, resolve_instrument, resolved_risk_params,
+                                     strategy_supports)
 
 
 def load_config(path: Path) -> dict:
@@ -44,14 +48,19 @@ def load_config(path: Path) -> dict:
         raise ValueError(f'Research config must be a YAML mapping: {path}')
     defaults = {
         'storage_root': 'data/market/mt5', 'reports_root': 'reports/research',
+        'instrument_registry': 'configs/instruments.yaml',
         'symbols': 'catalog', 'timeframes': 'all', 'strategies': 'all',
         'start_utc': None, 'end_utc': None, 'max_jobs': None,
         'rolling': {'enabled': True, 'window_days': 30, 'step_days': 5, 'warmup_bars': 300},
         'monte_carlo': {'enabled': False, 'n_sims': 10_000},
+        'data_quality': {'min_bars': 100, 'min_bars_by_timeframe': {}, 'fail_on_duplicates': True, 'fail_on_null_ohlc': True,
+                         'fail_on_impossible_ohlc': True, 'gap_warning_multiplier': 3},
+        'walk_forward': {'enabled': False, 'train_days': 180, 'test_days': 30,
+                         'step_days': 30, 'warmup_bars': 300, 'parameter_grids': {}},
     }
     for key, value in defaults.items():
         config.setdefault(key, value)
-    for nested in ('rolling', 'monte_carlo'):
+    for nested in ('rolling', 'monte_carlo', 'data_quality', 'walk_forward'):
         merged = dict(defaults[nested])
         merged.update(config.get(nested) or {})
         config[nested] = merged
@@ -97,10 +106,11 @@ def safe_id(value: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', value).strip('._') or 'item'
 
 
-def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe, config):
+def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe, config,
+                ftmo_rules, risk_params):
     """Run exactly one isolated strategy/pair without sharing indicator state."""
-    guard = ComplianceGuard(BOT_ROOT / 'configs' / 'ftmo_rules.yaml', BOT_ROOT / 'configs' / 'risk_params.yaml')
-    risk = RiskManager(BOT_ROOT / 'configs' / 'risk_params.yaml')
+    guard = ComplianceGuard(ftmo_rules, risk_params)
+    risk = RiskManager(risk_params)
     strategy = strategy_class(dict(params))
     prepared = strategy.prepare_data(raw_df.copy())
     trades = BacktestEngine(prepared, strategy, risk, guard).run()
@@ -115,8 +125,7 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
     if rolling['enabled']:
         rolling_results = run_rolling_window_backtest(
             df=raw_df, strategy_factory=lambda: strategy_class(dict(params)),
-            ftmo_rules_path=BOT_ROOT / 'configs' / 'ftmo_rules.yaml',
-            risk_params_path=BOT_ROOT / 'configs' / 'risk_params.yaml',
+            ftmo_rules_path=ftmo_rules, risk_params_path=risk_params,
             window_days=rolling['window_days'], step_days=rolling['step_days'], warmup_bars=rolling['warmup_bars'],
         )
         rolling_metrics = summarize(rolling_results)
@@ -126,6 +135,17 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
             trades[['exit_time', 'pnl_pct']], n_sims=config['monte_carlo']['n_sims']
         )
         mc_metrics['source_scope'] = 'full_simulation_including_post_failure'
+    walk_forward_results = pd.DataFrame()
+    walk_forward_metrics = {'status': 'disabled'}
+    walk_forward = config['walk_forward']
+    if walk_forward['enabled']:
+        walk_forward_results = run_walk_forward_backtest(
+            raw_df, strategy_class, params, ftmo_rules, risk_params,
+            train_days=walk_forward['train_days'], test_days=walk_forward['test_days'],
+            step_days=walk_forward['step_days'], warmup_bars=walk_forward['warmup_bars'],
+            parameter_grid=(walk_forward.get('parameter_grids') or {}).get(strategy_name, {}),
+        )
+        walk_forward_metrics = summarize_walk_forward(walk_forward_results)
     return trades, {
         **metrics, 'initial_balance': guard.initial_balance,
         'simulation_scope': 'full_history_including_post_failure',
@@ -133,7 +153,8 @@ def execute_job(strategy_name, strategy_class, raw_df, params, symbol, timeframe
         'first_fail_reason': trades.attrs.get('first_fail_reason'),
         'post_failure_trades': sum(bool(trade.get('post_failure_entry', False)) for trade in history),
         'monte_carlo': mc_metrics, 'rolling_window': rolling_metrics,
-    }, rolling_results, strategy, guard, risk
+        'walk_forward': walk_forward_metrics,
+    }, rolling_results, walk_forward_results, strategy, guard, risk
 
 
 def run_research(config: dict) -> dict:
@@ -153,22 +174,46 @@ def run_research(config: dict) -> dict:
     commit = get_git_commit()
     catalog.start_run(run_id, iso_utc(created), config, commit, manifest_path)
     try:
+        registry_path = Path(config['instrument_registry'])
+        if not registry_path.is_absolute():
+            registry_path = BOT_ROOT / registry_path
+        instrument_registry = load_yaml(registry_path)
+        base_risk = load_yaml(BOT_ROOT / 'configs' / 'risk_params.yaml')
+        ftmo_rules = load_yaml(BOT_ROOT / 'configs' / 'ftmo_rules.yaml')
         pairs = select_pairs(store, config)
         strategies = select_strategies(config)
-        jobs = [(name, klass, symbol, timeframe) for name, klass in strategies for symbol, timeframe in pairs]
+        admission_results = []
+        jobs = []
+        for name, klass in strategies:
+            for symbol, timeframe in pairs:
+                try:
+                    instrument = resolve_instrument(instrument_registry, symbol)
+                    allowed, reason = strategy_supports(klass, instrument, timeframe)
+                    if not allowed:
+                        raise ValueError(reason)
+                    jobs.append((name, klass, symbol, timeframe, instrument))
+                except ValueError as error:
+                    admission_results.append({
+                        'job_id': f'{safe_id(name)}__{safe_id(symbol)}__{safe_id(timeframe)}',
+                        'strategy': name, 'symbol': symbol, 'timeframe': timeframe,
+                        'status': 'skipped', 'reason': str(error),
+                    })
         if config['max_jobs'] is not None:
             jobs = jobs[:config['max_jobs']]
-        if not jobs:
+        if not jobs and not admission_results:
             raise RuntimeError('No research jobs selected. Sync MT5 data first or relax research.yaml filters.')
         manifest = {
             'schema_version': 1, 'run_id': run_id, 'created_at_utc': iso_utc(created),
             'git_commit': commit, 'configuration': config,
-            'selected_jobs': [{'strategy': n, 'symbol': s, 'timeframe': t} for n, _, s, t in jobs],
+            'selected_jobs': [{'strategy': n, 'symbol': s, 'timeframe': t} for n, _, s, t, _ in jobs],
+            'admission_skips': admission_results,
         }
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-        summary = []
+        summary = list(admission_results)
         print(f'[*] Research {run_id}: {len(strategies)} strategies × {len(pairs)} lake pairs = {len(jobs)} jobs')
-        for index, (name, klass, symbol, timeframe) in enumerate(jobs, start=1):
+        if admission_results:
+            print(f'[*] Skipped {len(admission_results)} incompatible/unprofiled jobs before execution.')
+        for index, (name, klass, symbol, timeframe, instrument) in enumerate(jobs, start=1):
             job_id = f'{safe_id(name)}__{safe_id(symbol)}__{safe_id(timeframe)}'
             print(f'[{index}/{len(jobs)}] {name} · {symbol} {timeframe}', end=' ... ', flush=True)
             snapshot = None
@@ -176,14 +221,18 @@ def run_research(config: dict) -> dict:
                 snapshot = store.data_snapshot(symbol, timeframe, start=config['start_utc'], end=config['end_utc'])
                 catalog.start_job(run_id, job_id, name, symbol, timeframe, snapshot)
                 raw_df = store.read_bars(symbol, timeframe, start=config['start_utc'], end=config['end_utc'])
+                quality = validate_bars(raw_df, timeframe, config['data_quality'])
+                if quality['status'] == 'failed':
+                    raise ValueError('data-quality gate failed: ' + '; '.join(quality['failures']))
                 params = dict(load_strategy_params(name))
                 params.update({'symbol': symbol, 'timeframe': timeframe})
-                trades, metrics, rolling_results, strategy, guard, risk = execute_job(
-                    name, klass, raw_df, params, symbol, timeframe, config
+                risk_params = resolved_risk_params(base_risk, instrument)
+                trades, metrics, rolling_results, walk_forward_results, strategy, guard, risk = execute_job(
+                    name, klass, raw_df, params, symbol, timeframe, config, ftmo_rules, risk_params
                 )
                 report_path = save_report_and_trades(
                     name, job_id, trades.to_dict('records'), metrics, trades,
-                    rolling_results=rolling_results, reports_root=run_root,
+                    rolling_results=rolling_results, walk_forward_results=walk_forward_results, reports_root=run_root,
                     metadata={
                         'symbol': symbol, 'timeframe': timeframe,
                         'currency': guard.ftmo_rules.get('currency', 'USD'), 'bars': len(raw_df),
@@ -191,15 +240,19 @@ def run_research(config: dict) -> dict:
                         'source_timezone': guard.ftmo_rules.get('data_timezone', 'UTC'),
                         'report_timezone': guard.ftmo_rules.get('daily_reset_timezone', 'Europe/Prague'),
                         'git_commit': commit, 'data_fingerprint': snapshot['fingerprint'],
+                        'asset_class': instrument['asset_class'], 'data_quality_status': quality['status'],
                     },
                     config={'strategy': strategy.params, 'ftmo_rules': guard.ftmo_rules,
                             'risk': risk.risk_params, 'research': config,
-                            'data_snapshot': snapshot},
+                            'instrument': instrument, 'data_snapshot': snapshot,
+                            'data_quality': quality},
                 )
                 catalog.complete_job(run_id, job_id, report_path, metrics)
                 summary.append({'job_id': job_id, 'strategy': name, 'symbol': symbol, 'timeframe': timeframe,
                                 'status': 'completed', 'data_fingerprint': snapshot['fingerprint'],
                                 'net_profit': metrics['net_profit'], 'total_trades': metrics['total_trades'],
+                                'data_quality_status': quality['status'],
+                                'walk_forward_oos_net_profit': metrics['walk_forward'].get('oos_net_profit'),
                                 'report_path': str(report_path)})
                 print(f"OK · P/L {metrics['net_profit']:.2f} · {metrics['total_trades']} trades")
             except Exception as error:
@@ -219,7 +272,9 @@ def run_research(config: dict) -> dict:
         except ImportError:
             pass
         completed = int((summary_frame.status == 'completed').sum())
-        result = {'run_id': run_id, 'jobs': len(summary), 'completed': completed, 'failed': len(summary) - completed,
+        failed = int((summary_frame.status == 'failed').sum())
+        skipped = int((summary_frame.status == 'skipped').sum())
+        result = {'run_id': run_id, 'jobs': len(summary), 'completed': completed, 'failed': failed, 'skipped': skipped,
                   'run_root': str(run_root)}
         manifest.update({'completed_at_utc': iso_utc(datetime.now(timezone.utc)), 'summary': result, 'results': summary})
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding='utf-8')

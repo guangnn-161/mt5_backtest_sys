@@ -1,0 +1,26 @@
+# Exact broker symbols allowed into research. Missing symbols are skipped rather
+# than silently reusing XAUUSD execution costs on an unrelated instrument.
+symbols:
+  XAUUSD:
+    enabled: true
+    asset_class: metal
+    quote_currency: USD
+    execution:
+      contract_size: 100
+      point_size: 0.01
+      spread_points: 20
+      slippage_points: 5
+      commission_per_lot_round_turn_usd: 0.0
+      intrabar_policy: stop_first
+  XAUUSDm:
+    enabled: true
+    asset_class: metal
+    quote_currency: USD
+    execution:
+      contract_size: 100
+      point_size: 0.01
+      spread_points: 20
+      slippage_points: 5
+      commission_per_lot_round_turn_usd: 0.0
+      intrabar_policy: stop_first
+

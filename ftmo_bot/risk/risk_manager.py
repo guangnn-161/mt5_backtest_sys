@@ -1,12 +1,17 @@
 # File: risk/risk_manager.py
 import yaml
 from math import floor
+from pathlib import Path
 
 
 class RiskManager:
-    def __init__(self, risk_config_path: str):
-        with open(risk_config_path, 'r', encoding='utf-8') as f:
-            self.risk_params = yaml.safe_load(f)
+    def __init__(self, risk_config_path: str | Path | dict):
+        """Load risk settings from YAML or an already-resolved research profile."""
+        if isinstance(risk_config_path, dict):
+            self.risk_params = dict(risk_config_path)
+        else:
+            with open(risk_config_path, 'r', encoding='utf-8') as f:
+                self.risk_params = yaml.safe_load(f)
 
         self.risk_per_trade_pct = self.risk_params["risk_per_trade_pct"]
         self.max_open_risk_pct = self.risk_params["max_open_risk_pct"]

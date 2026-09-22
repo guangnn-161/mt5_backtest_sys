@@ -2,6 +2,8 @@
 import pandas as pd
 from pathlib import Path
 from datetime import timedelta
+from itertools import product
+import json
 
 from backtest.engine import BacktestEngine
 from risk.compliance_guard import ComplianceGuard
@@ -182,4 +184,125 @@ def summarize(results: pd.DataFrame) -> dict:
         "p_timeout_across_history": round(float((results['outcome'] == 'timeout').sum() / n * 100), 2),
         "worst_max_dd_pct": round(float(worst_dd), 2) if pd.notna(worst_dd) else None,
         "median_days_to_pass": float(median_days) if pd.notna(median_days) else None,
+    }
+
+
+def _set_param(params: dict, dotted_key: str, value) -> None:
+    target = params
+    pieces = dotted_key.split('.')
+    for piece in pieces[:-1]:
+        target = target.setdefault(piece, {})
+        if not isinstance(target, dict):
+            raise ValueError(f'Parameter path is not a mapping: {dotted_key}')
+    target[pieces[-1]] = value
+
+
+def expand_parameter_grid(base_params: dict, parameter_grid: dict | None) -> list[dict]:
+    """Expand a declarative dotted-key grid without introducing an optimizer dependency."""
+    grid = parameter_grid or {}
+    if not isinstance(grid, dict):
+        raise ValueError('walk-forward parameter_grid must be a mapping of dotted key to values')
+    if not grid:
+        return [dict(base_params)]
+    keys = sorted(grid)
+    values = []
+    for key in keys:
+        candidates = grid[key]
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f'Parameter grid {key} must be a non-empty list')
+        values.append(candidates)
+    result = []
+    for combination in product(*values):
+        params = json.loads(json.dumps(base_params))
+        for key, value in zip(keys, combination):
+            _set_param(params, key, value)
+        result.append(params)
+    return result
+
+
+def _context_for_window(df, start_position, end_position, warmup_bars):
+    context_start = max(0, start_position - warmup_bars)
+    return df.iloc[context_start:end_position + 1].copy(), df.iloc[start_position]['time']
+
+
+def _run_window(df, start_position, end_position, strategy_class, params,
+                ftmo_rules, risk_params, warmup_bars):
+    context, trading_start = _context_for_window(df, start_position, end_position, warmup_bars)
+    strategy = strategy_class(dict(params))
+    prepared = strategy.prepare_data(context)
+    engine = BacktestEngine(
+        prepared, strategy, RiskManager(risk_params), ComplianceGuard(ftmo_rules, risk_params),
+        trading_start_time=trading_start,
+    )
+    return engine.run()
+
+
+def run_walk_forward_backtest(
+    df: pd.DataFrame,
+    strategy_class,
+    base_params: dict,
+    ftmo_rules: dict | Path,
+    risk_params: dict | Path,
+    *, train_days: int = 180, test_days: int = 30, step_days: int = 30,
+    warmup_bars: int = 300, parameter_grid: dict | None = None,
+) -> pd.DataFrame:
+    """Chronological train-select-test evaluation with no test-period parameter use.
+
+    The chosen candidate is the best *non-hard-breaching* configuration by
+    train net P/L; any hard breach ranks below a non-breaching candidate. Test
+    windows are fresh account simulations and never feed back into selection.
+    """
+    if min(train_days, test_days, step_days) <= 0 or warmup_bars < 0:
+        raise ValueError('train_days/test_days/step_days must be positive and warmup_bars non-negative')
+    frame = df.sort_values('time').reset_index(drop=True).copy()
+    frame['time'] = pd.to_datetime(frame['time'])
+    days = sorted(frame['time'].dt.date.unique())
+    candidates = expand_parameter_grid(base_params, parameter_grid)
+    results = []
+    for start_idx in range(0, len(days), step_days):
+        train_start = days[start_idx]
+        train_end = train_start + timedelta(days=train_days - 1)
+        test_start = train_end + timedelta(days=1)
+        test_end = test_start + timedelta(days=test_days - 1)
+        if test_end > days[-1]:
+            break
+        train_positions = frame.index[(frame.time.dt.date >= train_start) & (frame.time.dt.date <= train_end)]
+        test_positions = frame.index[(frame.time.dt.date >= test_start) & (frame.time.dt.date <= test_end)]
+        # Do not impose an M5-specific bar count: D1/W1 research naturally has
+        # fewer rows. Individual strategies may still decline to trade until
+        # their own indicators have enough warm-up history.
+        if len(train_positions) < 2 or len(test_positions) < 2:
+            continue
+        scored = []
+        for params in candidates:
+            trades = _run_window(frame, int(train_positions[0]), int(train_positions[-1]),
+                                 strategy_class, params, ftmo_rules, risk_params, warmup_bars)
+            pnl = float(trades.pnl_usd.sum()) if not trades.empty else 0.0
+            breached = trades.attrs.get('first_fail_time') is not None
+            scored.append((not breached, pnl, params, trades))
+        _, train_pnl, selected_params, train_trades = max(scored, key=lambda item: (item[0], item[1]))
+        test_trades = _run_window(frame, int(test_positions[0]), int(test_positions[-1]),
+                                  strategy_class, selected_params, ftmo_rules, risk_params, warmup_bars)
+        test_pnl = float(test_trades.pnl_usd.sum()) if not test_trades.empty else 0.0
+        results.append({
+            'train_start': train_start, 'train_end': train_end,
+            'test_start': test_start, 'test_end': test_end,
+            'candidate_count': len(candidates), 'selected_params_json': json.dumps(selected_params, sort_keys=True),
+            'train_net_profit': train_pnl, 'train_hard_breach': train_trades.attrs.get('first_fail_time') is not None,
+            'test_net_profit': test_pnl, 'test_total_trades': len(test_trades),
+            'test_hard_breach': test_trades.attrs.get('first_fail_time') is not None,
+            'test_first_fail_time': test_trades.attrs.get('first_fail_time'),
+        })
+    return pd.DataFrame(results)
+
+
+def summarize_walk_forward(results: pd.DataFrame) -> dict:
+    if results.empty:
+        return {'num_windows': 0}
+    return {
+        'num_windows': int(len(results)),
+        'oos_net_profit': float(results.test_net_profit.sum()),
+        'oos_profitable_windows_pct': round(float((results.test_net_profit > 0).mean() * 100), 2),
+        'oos_hard_breach_windows_pct': round(float(results.test_hard_breach.mean() * 100), 2),
+        'candidate_count_per_window': int(results.candidate_count.max()),
     }

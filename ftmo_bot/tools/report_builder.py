@@ -21,6 +21,10 @@ TRADE_COLUMNS = ['signal_time', 'entry_time', 'exit_time', 'type', 'entry', 'sl'
 ROLLING_COLUMNS = ['start_date', 'end_date', 'outcome', 'days_to_result',
                    'max_dd_in_window_pct', 'num_trades', 'num_trades_full_simulation',
                    'post_failure_trades', 'ending_balance_full_simulation']
+WALK_FORWARD_COLUMNS = ['train_start', 'train_end', 'test_start', 'test_end',
+                        'candidate_count', 'selected_params_json', 'train_net_profit',
+                        'train_hard_breach', 'test_net_profit', 'test_total_trades',
+                        'test_hard_breach', 'test_first_fail_time']
 
 
 def clean_json(value):
@@ -189,6 +193,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     ])
     mc = m.get('monte_carlo', {})
     rolling = m.get('rolling_window', {})
+    walk_forward = m.get('walk_forward', {})
     robustness = '<div class="two">' + table('Monte Carlo · empirical outcomes', [
         ('Pass', fmt(mc.get('p_pass'), 'pct')), ('Fail daily loss', fmt(mc.get('p_fail_daily_loss'), 'pct')),
         ('Fail total loss', fmt(mc.get('p_fail_max_dd'), 'pct')), ('Timeout', fmt(mc.get('p_timeout'), 'pct')),
@@ -202,6 +207,13 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
         ('Timeouts', fmt(rolling.get('p_timeout_across_history'), 'pct')),
         ('Worst window DD', fmt(rolling.get('worst_max_dd_pct'), 'pct')),
         ('Median days to pass', fmt(rolling.get('median_days_to_pass'))),
+    ]) + table('Walk-forward · out of sample', [
+        ('Windows', fmt(walk_forward.get('num_windows', 0), 'int')),
+        ('OOS net profit', fmt(walk_forward.get('oos_net_profit'))),
+        ('Profitable OOS windows', fmt(walk_forward.get('oos_profitable_windows_pct'), 'pct')),
+        ('OOS hard-breach windows', fmt(walk_forward.get('oos_hard_breach_windows_pct'), 'pct')),
+        ('Candidates / window', fmt(walk_forward.get('candidate_count_per_window'), 'int')),
+        ('Status', esc(walk_forward.get('status', 'completed'))),
     ]) + '</div>'
     methodology = '''<div class="panel pad method">
 <p><strong>Scope.</strong> Profit and trade statistics include the complete simulation, including trades after a hard failure. The original failure timestamp stays fixed. Rolling-window outcomes remain separate from the continued path. No hard breach does not by itself mean the challenge passed.</p>
@@ -226,7 +238,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     css = (Path(__file__).parent / 'templates/report.css').read_text(encoding='utf-8')
     demo = '<div class="demo">SYNTHETIC DEMO — layout preview only; not actual strategy results.</div>' if meta.get('is_demo') else ''
     nav = ''.join(f'<a href="#{anchor}">{title}</a>' for anchor,title in [('overview','Overview'),('performance','Statistics'),('risk','Equity & risk'),('trades','Trades'),('calendar','Monthly'),('robustness','Robustness'),('ledger','Ledger'),('methods','Methodology')])
-    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','All trades'),('equity_curve.csv','Equity & balance'),('rolling_windows.csv','Rolling windows'),('daily_returns.csv','Daily returns'),('monthly_returns.csv','Monthly returns')])
+    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','All trades'),('equity_curve.csv','Equity & balance'),('rolling_windows.csv','Rolling windows'),('walk_forward.csv','Walk-forward windows'),('daily_returns.csv','Daily returns'),('monthly_returns.csv','Monthly returns')])
     return f'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(strategy)} · Backtest research report</title><style>{css}</style></head><body><main class="shell">
 <div class="masthead"><div class="brand">QUANT / RESEARCH</div><div class="edition">STRATEGY TESTER REPORT · {esc(meta['created_at'])}</div></div>{demo}
 <header class="hero"><div class="eyebrow">Systematic trading · performance dossier</div><h1>{esc(strategy.upper())}</h1><p>{esc(meta.get('symbol','N/A'))} · {esc(meta.get('timeframe','N/A'))} &nbsp; / &nbsp; {esc(meta.get('period_start','N/A'))} → {esc(meta.get('period_end','N/A'))}</p>
@@ -237,7 +249,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
 
 
 def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=None, *,
-                    rolling_results=None, metadata=None, config=None, reports_root=None, created_at=None):
+                    rolling_results=None, walk_forward_results=None, metadata=None, config=None, reports_root=None, created_at=None):
     meta, config = dict(metadata or {}), dict(config or {})
     timestamp = created_at or datetime.now(timezone.utc)
     if timestamp.tzinfo is None:
@@ -266,6 +278,8 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     curve = attrs.get('equity_curve', pd.DataFrame(columns=['time','balance','equity','is_failed'])).copy()
     if rolling_results is None or rolling_results.empty:
         rolling_results = pd.DataFrame(columns=ROLLING_COLUMNS)
+    if walk_forward_results is None or walk_forward_results.empty:
+        walk_forward_results = pd.DataFrame(columns=WALK_FORWARD_COLUMNS)
     initial = metrics.get('initial_balance') or attrs.get('initial_balance')
     if initial is None:
         raise ValueError('Reports require initial_balance; it is never inferred as $10,000')
@@ -282,11 +296,12 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     payload = {'schema_version': 1, 'run_id': run_id, 'strategy': strategy_name,
                'metadata': meta, 'metrics': full_metrics, 'configuration': config,
                'artifacts': ['report.html', 'report.json', 'trades.csv', 'equity_curve.csv',
-                             'rolling_windows.csv', 'daily_returns.csv', 'monthly_returns.csv']
+                             'rolling_windows.csv', 'walk_forward.csv', 'daily_returns.csv', 'monthly_returns.csv']
                             + ['images/' + p.name for p in images]}
     (folder / 'report.json').write_text(json.dumps(clean_json(payload), ensure_ascii=False,
                                                 indent=2, allow_nan=False), encoding='utf-8')
     for name, frame in [('trades',trades),('equity_curve',curve),('rolling_windows',rolling_results),
+                        ('walk_forward',walk_forward_results),
                         ('daily_returns',daily),('monthly_returns',monthly)]:
         frame.to_csv(folder / (name + '.csv'), index=False)
     (folder / 'report.html').write_text(build_html(strategy_name, run_id, full_metrics, meta,

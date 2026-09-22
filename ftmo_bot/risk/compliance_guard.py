@@ -4,11 +4,19 @@ from pathlib import Path
 
 
 class ComplianceGuard:
-    def __init__(self, ftmo_rules_path: Path, risk_params_path: Path):
-        with open(ftmo_rules_path, 'r', encoding='utf-8') as f:
-            self.ftmo_rules = yaml.safe_load(f)
-        with open(risk_params_path, 'r', encoding='utf-8') as f:
-            self.risk_params = yaml.safe_load(f)
+    def __init__(self, ftmo_rules_path: Path | dict, risk_params_path: Path | dict):
+        # Research jobs resolve an instrument profile in memory; the original
+        # YAML-path API stays supported for main.py and existing callers.
+        if isinstance(ftmo_rules_path, dict):
+            self.ftmo_rules = dict(ftmo_rules_path)
+        else:
+            with open(ftmo_rules_path, 'r', encoding='utf-8') as f:
+                self.ftmo_rules = yaml.safe_load(f)
+        if isinstance(risk_params_path, dict):
+            self.risk_params = dict(risk_params_path)
+        else:
+            with open(risk_params_path, 'r', encoding='utf-8') as f:
+                self.risk_params = yaml.safe_load(f)
 
         # Đọc initial_balance THẬT từ config, không hard-code
         self.initial_balance = float(self.ftmo_rules["account_size"])

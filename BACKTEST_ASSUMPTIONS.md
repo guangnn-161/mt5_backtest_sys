@@ -196,3 +196,47 @@ per strategy/pair are expensive and are best run later only on selected
 candidates. Change the filters and `max_jobs` in `research.yaml` to make a
 small, safe first run before launching a complete Market Watch × 21-timeframe
 batch.
+
+## Research admission gates
+
+The research runner now follows this order for every candidate job:
+
+1. **Instrument profile:** the exact broker symbol must appear in
+   `configs/instruments.yaml` with its asset class and execution costs. An
+   unprofiled symbol is recorded as *skipped*, never tested using XAUUSD costs.
+2. **Strategy compatibility:** each strategy explicitly declares supported asset
+   classes and timeframes. Current baseline strategies are intentionally limited
+   to metals and their declared short-term timeframes because their price-distance
+   settings are not portable to FX, indices or crypto.
+3. **Data quality:** `data_quality` in `research.yaml` rejects null OHLC,
+   duplicate timestamps, impossible/non-positive candles and insufficient bars.
+   Large time gaps are warnings only: weekend and holiday sessions cannot be
+   classified as errors without a broker-specific trading calendar.
+4. **Research evaluation:** only admitted data reaches the full backtest,
+   rolling-window test and optional Monte Carlo.
+
+`summary.csv` records completed, failed and skipped jobs. A skipped result is
+an intentional safety decision, not a zero-trade backtest.
+
+## Walk-forward train/test
+
+`walk_forward` in `research.yaml` implements chronological train-select-test
+windows. For each window, the runner expands the selected strategy's optional
+parameter grid, chooses the best non-hard-breaching train candidate (then train
+P/L), locks its parameters, and evaluates it on a fresh out-of-sample account.
+Test results never select later parameters.
+
+Leave it disabled until a small explicit grid is supplied, for example:
+
+```yaml
+walk_forward:
+  enabled: true
+  parameter_grids:
+    momentum:
+      momentum_params.body_threshold: [1.5, 2.0, 2.5]
+      momentum_params.stop_distance: [4.0, 5.0]
+```
+
+The detailed report exports `walk_forward.csv` and displays aggregate OOS
+profitability and hard-breach rates. It is still an OHLC research result, not
+evidence of tick-level MT5 execution identity.
