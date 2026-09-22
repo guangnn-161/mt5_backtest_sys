@@ -1,0 +1,8 @@
+# Run with: python ftmo_bot/tools/download_mt5_data.py
+# The first sync from 2010 across M1..MN1 can be very large. It is resumable:
+# re-run the same command after stopping it and only recent overlap is fetched.
+symbol_universe: market_watch
+timeframes: all
+history_start_utc: '2010-01-01T00:00:00Z'
+overlap_days: 3
+storage_root: data/market/mt5

@@ -122,3 +122,31 @@ An optional `configs/<strategy-name>_params.yaml` overrides the shared
 `configs/strategy_params.yaml` for that one strategy. The automatic name is the
 class name with the `Strategy` suffix removed and lower-cased: for example,
 `TripleMomentumStrategy` uses `triplemomentum_params.yaml` when present.
+
+## MT5 market-data lake
+
+Run `python ftmo_bot/tools/download_mt5_data.py` with the MT5 desktop terminal
+open and logged in. The default `configs/mt5_sync.yaml` synchronises every
+symbol currently visible in Market Watch, every standard MT5 timeframe
+(`M1` through `MN1`), and requests history from 2010-01-01 UTC. Market Watch
+is deliberate: do not use *Show All* unless the broker-wide data volume is
+intended.
+
+Install the two runtime dependencies into the same Python interpreter first:
+
+`python -m pip install MetaTrader5 pyarrow`
+
+Data is stored outside Git under `ftmo_bot/data/market/mt5/`:
+
+- `bars/<symbol>/<timeframe>/<year>/<month>.parquet`: compressed, monthly OHLCV
+  partitions. A write atomically replaces only the affected month.
+- `catalog.sqlite`: coverage, row counts, last successful timestamp, errors and
+  per-symbol/timeframe state. It uses WAL mode so it is robust to interruption.
+- `manifests/mt5_sync_*.json`: a concise result for each batch run.
+
+The downloader connects to MT5 once, processes pairs serially, continues after
+individual failures, and merges a three-day overlap before the latest stored
+candle. It is safe to stop with Ctrl+C and run again: existing partitions are
+deduplicated by UTC candle time and only missing/recent history is requested.
+The first 2010-to-present M1 download across many Market Watch symbols can take
+hours and consume many GB; the catalog lets that initial ingestion be resumed.
