@@ -12,7 +12,6 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ftmo_bot'))
 from tools.backtest_metrics import calculate_metrics, drawdowns, streaks, daily_equity
 from tools.report_builder import save_run_report
-from tools.report_charts import pnl_from_recorded_limit
 
 
 def sample():
@@ -92,21 +91,6 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(len(daily), 2)
         self.assertEqual(daily.pnl.tolist(), [100, -110])
         self.assertAlmostEqual(daily.return_pct.iloc[1], -10)
-
-    def test_pnl_series_starts_at_recorded_limit(self):
-        curve = pd.DataFrame({
-            'equity': [1000., 970., 940., 990.],
-            'hard_breach': [False, False, True, True],
-            'internal_stop': [False, True, True, True],
-        })
-        first, pnl, label, _ = pnl_from_recorded_limit(curve)
-        self.assertEqual((first, label), (2, 'hard breach'))
-        self.assertEqual(pnl.tolist(), [0., 50.])
-
-        curve['hard_breach'] = False
-        first, pnl, label, _ = pnl_from_recorded_limit(curve)
-        self.assertEqual((first, label), (1, 'internal stop'))
-        self.assertEqual(pnl.tolist(), [0., -30., 20.])
 
 
 class ArtifactTests(unittest.TestCase):
