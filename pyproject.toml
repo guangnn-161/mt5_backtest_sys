@@ -7,6 +7,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "metatrader5>=5.0.6180",
     "pandas>=3.0.5",
+    "pyarrow>=18.1.0",
     "pytz>=2026.3.post1",
     "pyyaml>=6.0.3",
 ]

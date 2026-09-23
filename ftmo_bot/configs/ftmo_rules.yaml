@@ -7,4 +7,7 @@ max_total_loss_usd: 1000
 profit_target_pct: 10.0
 profit_target_usd: 1000
 drawdown_type: static_from_initial
-daily_reset_timezone: CET
+# MT5 epoch timestamps exported by download_mt5_data.py are UTC. FTMO's trading
+# day follows Prague time, including daylight-saving transitions.
+data_timezone: UTC
+daily_reset_timezone: Europe/Prague

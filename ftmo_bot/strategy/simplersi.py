@@ -4,6 +4,8 @@ import pandas as pd
 
 
 class SimpleRSIStrategy(BaseStrategy):
+    supported_asset_classes = ('metal',)
+    supported_timeframes = ('M5', 'M15')
     def __init__(self, params: dict = None):
         # Định nghĩa sẵn thông số mặc định ngay trong code
         default_params = {

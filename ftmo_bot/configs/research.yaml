@@ -1,0 +1,51 @@
+# Run with: python ftmo_bot/tools/run_research.py
+# This consumes only data already synced from MT5 into the Parquet lake.
+storage_root: data/market/mt5
+reports_root: reports/research
+instrument_registry: configs/instruments.yaml
+
+# "catalog" means every successfully synced pair; "all" means all discovered strategies.
+symbols: catalog
+timeframes: all
+strategies: all
+
+# Optional UTC-bounded slice. Leave null to test all catalogued history.
+start_utc: null
+end_utc: null
+max_jobs: null
+
+data_quality:
+  min_bars: 100
+  min_bars_by_timeframe:
+    M1: 2000
+    M5: 1000
+    M15: 500
+    H1: 250
+    D1: 100
+    W1: 52
+    MN1: 24
+  fail_on_duplicates: true
+  fail_on_null_ohlc: true
+  fail_on_impossible_ohlc: true
+  gap_warning_multiplier: 3
+
+rolling:
+  enabled: true
+  window_days: 30
+  step_days: 5
+  warmup_bars: 300
+
+# Monte Carlo is deliberately off for a large grid: turn it on only for selected candidates.
+monte_carlo:
+  enabled: false
+  n_sims: 10000
+
+# True chronological train/select/test. Keep off until you declare a small
+# strategy-specific parameter grid below and have passed data-quality gates.
+walk_forward:
+  enabled: false
+  train_days: 180
+  test_days: 30
+  step_days: 30
+  warmup_bars: 300
+  parameter_grids: {}

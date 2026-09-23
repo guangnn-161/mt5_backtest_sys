@@ -2,6 +2,8 @@
 import pandas as pd
 from pathlib import Path
 from datetime import timedelta
+from itertools import product
+import json
 
 from backtest.engine import BacktestEngine
 from risk.compliance_guard import ComplianceGuard
@@ -16,18 +18,21 @@ def run_rolling_window_backtest(
     risk_params_path: Path,
     window_days: int = 30,
     step_days: int = 5,
+    warmup_bars: int = 300,
+    enforce_limits: bool = True,
 ) -> pd.DataFrame:
     """
     Chạy backtest độc lập tại nhiều điểm bắt đầu khác nhau trong lịch sử.
     Mỗi window mô phỏng: "nếu FTMO Challenge của tôi bắt đầu đúng ngày này thì sao?"
 
     Trả về DataFrame, mỗi dòng là kết quả của một window:
-    start_date, end_date, outcome ('pass'/'fail_daily'/'fail_dd'/'timeout'),
+    start_date, end_date, outcome
+    ('pass'/'fail_daily'/'fail_total'/'internal_stop'/'timeout'),
     days_to_result, max_dd_in_window_pct, num_trades
     """
     
-    if window_days <= 0 or step_days <= 0:
-        raise ValueError("window_days và step_days phải lớn hơn 0")
+    if window_days <= 0 or step_days <= 0 or warmup_bars < 0:
+        raise ValueError("window_days/step_days must be positive and warmup_bars non-negative")
 
     df = df.sort_values('time').reset_index(drop=True).copy()
     df['date_only'] = pd.to_datetime(df['time']).dt.date
@@ -45,28 +50,39 @@ def run_rolling_window_backtest(
         if window_end_day > unique_days[-1]:
             break
 
-        window_df = df[
-            (df['date_only'] >= window_start_day) & (
-                df['date_only'] <= window_end_day)
-        ].drop(columns=['date_only'])
+        window_mask = (
+            (df['date_only'] >= window_start_day)
+            & (df['date_only'] <= window_end_day)
+        )
+        window_positions = df.index[window_mask]
+        window_df = df.loc[window_mask].drop(columns=['date_only'])
 
         if len(window_df) < 50:  # quá ít dữ liệu (window cuối bị cắt cụt) -> bỏ qua
             break
 
-        # Mỗi window cần instance MỚI hoàn toàn — tránh rò rỉ trạng thái (balance, peak...)
-        # giữa các lần chạy
+        # Include history only to initialise causal indicators and state. The engine
+        # explicitly forbids orders before the first bar of the test window.
+        context_start = max(0, int(window_positions[0]) - warmup_bars)
+        context_end = int(window_positions[-1])
+        context_df = df.iloc[context_start:context_end + 1].drop(
+            columns=['date_only']
+        )
+
         guard = ComplianceGuard(ftmo_rules_path, risk_params_path)
         risk_mgr = RiskManager(risk_params_path)
         strategy = strategy_factory()
-        # Chỉ báo phải được tính riêng trong window để không rò rỉ trạng thái
-        # từ các ngày đứng trước thời điểm giả lập Challenge.
-        window_df = strategy.prepare_data(window_df.copy())
+        context_df = strategy.prepare_data(context_df.copy())
 
         engine = BacktestEngine(
-            df=window_df,
+            df=context_df,
             strategy=strategy,
             risk_manager=risk_mgr,
             compliance_guard=guard,
+            trading_start_time=window_df.iloc[0]['time'],
+            # Callers choose whether a robustness window uses FTMO limits.
+            continue_after_failure=False,
+            enforce_limits=enforce_limits,
+            enforce_internal_stop=False,
         )
         trades = engine.run()
 
@@ -96,6 +112,11 @@ def run_rolling_window_backtest(
             "days_to_result": days_to_result,
             "max_dd_in_window_pct": max_dd_pct,
             "num_trades": len(trades_to_result),
+            "num_trades_full_simulation": len(trades),
+            "post_failure_trades": (
+                int(trades['post_failure_entry'].sum()) if not trades.empty else 0
+            ),
+            "ending_balance_full_simulation": trades.attrs['ending_balance'],
         })
 
         start_idx += step_days
@@ -118,11 +139,25 @@ def _classify_outcome(trades: pd.DataFrame, guard: ComplianceGuard, start_day, e
             pass_time = target_hits.iloc[0]['exit_time']
 
     fail_time = trades.attrs.get('first_fail_time')
-    if pass_time is not None and (fail_time is None or pass_time <= fail_time):
+    internal_stop_time = trades.attrs.get('first_internal_stop_time')
+    if (
+        pass_time is not None
+        and (fail_time is None or pass_time < fail_time)
+        and (internal_stop_time is None or pass_time < internal_stop_time)
+    ):
         return "pass", (pass_time.date() - start_day).days, pass_time
 
     if fail_time is not None:
-        return "fail", (fail_time.date() - start_day).days, fail_time
+        reason = trades.attrs.get('first_fail_reason', '')
+        fail_type = "fail_daily" if "Daily" in reason else "fail_total"
+        return fail_type, (fail_time.date() - start_day).days, fail_time
+
+    if internal_stop_time is not None:
+        return (
+            "internal_stop",
+            (internal_stop_time.date() - start_day).days,
+            internal_stop_time,
+        )
 
     return "timeout", (end_day - start_day).days, None
 
@@ -130,9 +165,9 @@ def _classify_outcome(trades: pd.DataFrame, guard: ComplianceGuard, start_day, e
 def _compute_max_dd_pct(equity_curve: pd.DataFrame, initial_balance: float):
     if equity_curve is None or equity_curve.empty:
         return None
-    running_max = equity_curve['equity'].cummax()
-    dd = (equity_curve['equity'] - running_max) / initial_balance * 100
-    return float(dd.min())
+    running_max = equity_curve['equity'].cummax().clip(lower=initial_balance)
+    dd = (running_max - equity_curve['equity']) / running_max * 100
+    return float(dd.max())
 
 
 def summarize(results: pd.DataFrame) -> dict:
@@ -143,12 +178,140 @@ def summarize(results: pd.DataFrame) -> dict:
     n = len(results)
     pass_mask = results['outcome'] == 'pass'
     median_days = results.loc[pass_mask, 'days_to_result'].median()
-    worst_dd = results['max_dd_in_window_pct'].min()
+    worst_dd = results['max_dd_in_window_pct'].max()
+    fail_mask = results['outcome'].str.startswith('fail')
+    internal_mask = results['outcome'] == 'internal_stop'
     return {
         "num_windows": n,
         "p_pass_across_history": round(float(pass_mask.sum() / n * 100), 2),
-        "p_fail_across_history": round(float((results['outcome'] == 'fail').sum() / n * 100), 2),
+        "p_fail_across_history": round(float(fail_mask.sum() / n * 100), 2),
+        "p_internal_stop_across_history": round(float(internal_mask.sum() / n * 100), 2),
         "p_timeout_across_history": round(float((results['outcome'] == 'timeout').sum() / n * 100), 2),
         "worst_max_dd_pct": round(float(worst_dd), 2) if pd.notna(worst_dd) else None,
         "median_days_to_pass": float(median_days) if pd.notna(median_days) else None,
+    }
+
+
+def _set_param(params: dict, dotted_key: str, value) -> None:
+    target = params
+    pieces = dotted_key.split('.')
+    for piece in pieces[:-1]:
+        target = target.setdefault(piece, {})
+        if not isinstance(target, dict):
+            raise ValueError(f'Parameter path is not a mapping: {dotted_key}')
+    target[pieces[-1]] = value
+
+
+def expand_parameter_grid(base_params: dict, parameter_grid: dict | None) -> list[dict]:
+    """Expand a declarative dotted-key grid without introducing an optimizer dependency."""
+    grid = parameter_grid or {}
+    if not isinstance(grid, dict):
+        raise ValueError('walk-forward parameter_grid must be a mapping of dotted key to values')
+    if not grid:
+        return [dict(base_params)]
+    keys = sorted(grid)
+    values = []
+    for key in keys:
+        candidates = grid[key]
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f'Parameter grid {key} must be a non-empty list')
+        values.append(candidates)
+    result = []
+    for combination in product(*values):
+        params = json.loads(json.dumps(base_params))
+        for key, value in zip(keys, combination):
+            _set_param(params, key, value)
+        result.append(params)
+    return result
+
+
+def _context_for_window(df, start_position, end_position, warmup_bars):
+    context_start = max(0, start_position - warmup_bars)
+    return df.iloc[context_start:end_position + 1].copy(), df.iloc[start_position]['time']
+
+
+def _run_window(df, start_position, end_position, strategy_class, params,
+                ftmo_rules, risk_params, warmup_bars, enforce_limits=True):
+    context, trading_start = _context_for_window(df, start_position, end_position, warmup_bars)
+    strategy = strategy_class(dict(params))
+    prepared = strategy.prepare_data(context)
+    engine = BacktestEngine(
+        prepared, strategy, RiskManager(risk_params), ComplianceGuard(ftmo_rules, risk_params),
+        trading_start_time=trading_start,
+        continue_after_failure=False,
+        enforce_limits=enforce_limits,
+        enforce_internal_stop=False,
+    )
+    return engine.run()
+
+
+def run_walk_forward_backtest(
+    df: pd.DataFrame,
+    strategy_class,
+    base_params: dict,
+    ftmo_rules: dict | Path,
+    risk_params: dict | Path,
+    *, train_days: int = 180, test_days: int = 30, step_days: int = 30,
+    warmup_bars: int = 300, parameter_grid: dict | None = None,
+    enforce_limits: bool = True,
+) -> pd.DataFrame:
+    """Chronological train-select-test evaluation with no test-period parameter use.
+
+    With FTMO limits enabled, a non-hard-breaching candidate ranks above a
+    breached one; without them candidates rank only by train net P/L. Test
+    windows are fresh account simulations and never feed back into selection.
+    """
+    if min(train_days, test_days, step_days) <= 0 or warmup_bars < 0:
+        raise ValueError('train_days/test_days/step_days must be positive and warmup_bars non-negative')
+    frame = df.sort_values('time').reset_index(drop=True).copy()
+    frame['time'] = pd.to_datetime(frame['time'])
+    days = sorted(frame['time'].dt.date.unique())
+    candidates = expand_parameter_grid(base_params, parameter_grid)
+    results = []
+    for start_idx in range(0, len(days), step_days):
+        train_start = days[start_idx]
+        train_end = train_start + timedelta(days=train_days - 1)
+        test_start = train_end + timedelta(days=1)
+        test_end = test_start + timedelta(days=test_days - 1)
+        if test_end > days[-1]:
+            break
+        train_positions = frame.index[(frame.time.dt.date >= train_start) & (frame.time.dt.date <= train_end)]
+        test_positions = frame.index[(frame.time.dt.date >= test_start) & (frame.time.dt.date <= test_end)]
+        # Do not impose an M5-specific bar count: D1/W1 research naturally has
+        # fewer rows. Individual strategies may still decline to trade until
+        # their own indicators have enough warm-up history.
+        if len(train_positions) < 2 or len(test_positions) < 2:
+            continue
+        scored = []
+        for params in candidates:
+            trades = _run_window(frame, int(train_positions[0]), int(train_positions[-1]),
+                                 strategy_class, params, ftmo_rules, risk_params, warmup_bars, enforce_limits)
+            pnl = float(trades.pnl_usd.sum()) if not trades.empty else 0.0
+            breached = trades.attrs.get('first_fail_time') is not None
+            scored.append((not breached, pnl, params, trades))
+        _, train_pnl, selected_params, train_trades = max(scored, key=lambda item: (item[0], item[1]))
+        test_trades = _run_window(frame, int(test_positions[0]), int(test_positions[-1]),
+                                  strategy_class, selected_params, ftmo_rules, risk_params, warmup_bars, enforce_limits)
+        test_pnl = float(test_trades.pnl_usd.sum()) if not test_trades.empty else 0.0
+        results.append({
+            'train_start': train_start, 'train_end': train_end,
+            'test_start': test_start, 'test_end': test_end,
+            'candidate_count': len(candidates), 'selected_params_json': json.dumps(selected_params, sort_keys=True),
+            'train_net_profit': train_pnl, 'train_hard_breach': train_trades.attrs.get('first_fail_time') is not None,
+            'test_net_profit': test_pnl, 'test_total_trades': len(test_trades),
+            'test_hard_breach': test_trades.attrs.get('first_fail_time') is not None,
+            'test_first_fail_time': test_trades.attrs.get('first_fail_time'),
+        })
+    return pd.DataFrame(results)
+
+
+def summarize_walk_forward(results: pd.DataFrame) -> dict:
+    if results.empty:
+        return {'num_windows': 0}
+    return {
+        'num_windows': int(len(results)),
+        'oos_net_profit': float(results.test_net_profit.sum()),
+        'oos_profitable_windows_pct': round(float((results.test_net_profit > 0).mean() * 100), 2),
+        'oos_hard_breach_windows_pct': round(float(results.test_hard_breach.mean() * 100), 2),
+        'candidate_count_per_window': int(results.candidate_count.max()),
     }

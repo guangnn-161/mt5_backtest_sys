@@ -1,725 +1,355 @@
-# FTMO MT5 Trading Bot — Tài liệu quy trình đầy đủ (Handoff Document)
+# FTMO Backtest Research Platform — Architecture & Workflow Handoff
 
-> **Mục đích của tài liệu này:** Mô tả toàn bộ quy trình nghiên cứu, phát triển, kiểm định và vận hành một trading bot (Expert Advisor) trên MetaTrader 5, với mục tiêu vượt qua bài kiểm tra quỹ (Challenge) của FTMO.
->
-> **Đối tượng đọc:** Một AI assistant khác hoặc một cộng tác viên kỹ thuật tiếp nhận dự án. Tài liệu được viết để người/AI đọc có thể nắm được bối cảnh, triết lý thiết kế, các quyết định kiến trúc, và có thể tiếp tục công việc mà không cần hỏi lại từ đầu.
->
-> **Trạng thái dự án:** Giai đoạn khởi tạo. Chưa chọn chiến lược cụ thể. Đã thống nhất kiến trúc tổng thể, phương pháp kiểm định (Monte Carlo), và hệ thống ghi log nghiên cứu.
->
-> **Ngày cập nhật:** 2026-09-17
+**Updated:** 2026-09-23
+
+**Current scope:** offline Python research/backtesting platform fed by MetaTrader 5 data.
+**Not in scope yet:** generating or operating an MQL5 Expert Advisor, live execution, or a claim that any current strategy has profitable alpha.
 
 ---
 
-## Mục lục
+## 1. Problem and design objective
 
-1. [Bối cảnh và mục tiêu](#1-bối-cảnh-và-mục-tiêu)
-2. [Luật chơi FTMO — ràng buộc thiết kế](#2-luật-chơi-ftmo--ràng-buộc-thiết-kế)
-3. [Triết lý thiết kế cốt lõi](#3-triết-lý-thiết-kế-cốt-lõi)
-4. [Lựa chọn công nghệ: Python vs MQL5](#4-lựa-chọn-công-nghệ-python-vs-mql5)
-5. [Kiến trúc thư mục dự án](#5-kiến-trúc-thư-mục-dự-án)
-6. [Pipeline 6 giai đoạn](#6-pipeline-6-giai-đoạn)
-7. [Risk Management Module — trái tim của hệ thống](#7-risk-management-module--trái-tim-của-hệ-thống)
-8. [Monte Carlo — phương pháp kiểm định chính](#8-monte-carlo--phương-pháp-kiểm-định-chính)
-9. [Hệ thống ghi log nghiên cứu hai tầng](#9-hệ-thống-ghi-log-nghiên-cứu-hai-tầng)
-10. [Gate criteria — tiêu chí chuyển giai đoạn](#10-gate-criteria--tiêu-chí-chuyển-giai-đoạn)
-11. [Vận hành và giám sát khi chạy live](#11-vận-hành-và-giám-sát-khi-chạy-live)
-12. [Những cạm bẫy đã biết](#12-những-cạm-bẫy-đã-biết)
-13. [Trạng thái hiện tại và bước tiếp theo](#13-trạng-thái-hiện-tại-và-bước-tiếp-theo)
-14. [Phụ lục: Code tham chiếu](#14-phụ-lục-code-tham-chiếu)
+This project answers a research question:
 
----
+> Given historical MT5 OHLC data, a strategy, execution assumptions and FTMO-style loss rules, how does the strategy behave across symbols, timeframes and historical start dates?
 
-## 1. Bối cảnh và mục tiêu
+The system deliberately separates two questions that are often mixed together:
 
-### 1.1. Mục tiêu dự án
+1. **Strategy quality:** What happens if the signal logic is allowed to trade through the whole history, with realistic position sizing and execution costs but without FTMO loss gates?
+2. **Challenge survivability:** What happens to the same strategy when FTMO hard daily-loss and total-loss rules stop new entries?
 
-Xây dựng một hệ thống giao dịch tự động chạy trên MetaTrader 5, có khả năng vượt qua FTMO Challenge — một bài kiểm tra do quỹ FTMO tổ chức, trong đó trader phải đạt mục tiêu lợi nhuận nhất định mà không vi phạm các giới hạn rủi ro nghiêm ngặt.
+The first question is the primary research result. The second is a compliance comparison and the basis of the current Monte Carlo simulation.
 
-### 1.2. Định nghĩa "thành công" của dự án
+### Non-negotiable principles
 
-Điểm quan trọng nhất cần hiểu: **mục tiêu không phải là tối đa hóa lợi nhuận, mà là tối đa hóa xác suất vượt qua bài kiểm tra.** Đây là hai bài toán khác nhau về bản chất:
-
-| | Tối đa lợi nhuận | Tối đa xác suất pass |
-|---|---|---|
-| Hàm mục tiêu | Expected return | P(đạt target AND không vi phạm limit) |
-| Thái độ với rủi ro | Chấp nhận drawdown sâu nếu kỳ vọng dương | Drawdown sâu = thất bại tuyệt đối |
-| Kích thước lệnh | Càng lớn càng tốt nếu edge dương | Nhỏ, vì vi phạm limit là game over |
-| Chỉ số đánh giá | Total return, Sharpe ratio | P(pass) qua mô phỏng Monte Carlo |
-
-Một chiến lược lãi 40%/năm nhưng có 30% khả năng chạm max drawdown 10% là **chiến lược tệ** cho mục đích này. Một chiến lược lãi 15%/năm với 95% khả năng không chạm limit là **chiến lược tốt**.
-
-Mọi quyết định thiết kế trong tài liệu này đều xuất phát từ nguyên tắc trên.
+- A strategy creates a signal; it does not know account balance, FTMO rules or broker APIs.
+- Risk sizing and compliance are distinct from signal logic.
+- One result is reproducible only when its input data snapshot, configuration, source commit and execution assumptions are preserved.
+- OHLC backtesting must not pretend to be tick-accurate MT5 testing.
+- A backtest is evidence for research, not evidence of future profitability or FTMO compliance.
 
 ---
 
-## 2. Luật chơi FTMO — ràng buộc thiết kế
+## 2. Current architecture
 
-> **Lưu ý cho AI đọc tài liệu này:** Các con số dưới đây là cấu hình phổ biến của gói FTMO Challenge tiêu chuẩn tại thời điểm viết tài liệu. FTMO có nhiều gói khác nhau (Normal, Aggressive, Swing) và có thể thay đổi điều khoản. **Luôn kiểm tra lại trên trang chủ FTMO trước khi đưa các con số này vào code.** Code phải đọc các giới hạn từ file config, không hard-code.
-
-### 2.1. Các ràng buộc chính (gói Challenge tiêu chuẩn)
-
-| Ràng buộc | Giá trị tham chiếu | Ý nghĩa với bot |
-|---|---|---|
-| **Profit target** | ~10% balance ban đầu | Phải đạt trong thời hạn quy định |
-| **Max daily loss** | ~5% balance ban đầu | Tính theo ngày, reset mỗi ngày mới. **Vi phạm = fail ngay lập tức** |
-| **Max total drawdown** | ~10% balance ban đầu | Tính từ đỉnh equity cao nhất hoặc balance ban đầu tùy gói. **Vi phạm = fail ngay lập tức** |
-| **Minimum trading days** | thường có yêu cầu tối thiểu | Bot không được đạt target quá nhanh rồi ngừng |
-| **Thời hạn** | thường có giới hạn ngày | Áp lực thời gian ảnh hưởng đến position sizing |
-
-### 2.2. Hai điểm kỹ thuật cực kỳ quan trọng và hay bị hiểu sai
-
-**(a) Daily loss thường tính trên equity, không chỉ balance.**
-Nghĩa là floating loss của lệnh đang mở cũng được tính vào. Một bot chỉ kiểm tra balance sẽ vi phạm mà không biết. Risk module **bắt buộc** phải giám sát equity real-time.
-
-**(b) Max drawdown có thể là trailing hoặc static tùy gói.**
-- *Static*: tính từ balance ban đầu — dễ hơn, càng lãi càng an toàn.
-- *Trailing*: tính từ đỉnh equity cao nhất từng đạt — khó hơn nhiều, lãi rồi vẫn có thể fail.
-
-Phải xác định rõ gói đang dùng là loại nào trước khi viết logic guard, vì logic hoàn toàn khác nhau.
-
-### 2.3. Ràng buộc về phương pháp giao dịch
-
-FTMO có các điều khoản cấm hoặc hạn chế một số kiểu giao dịch. Các kiểu sau cần được kiểm tra kỹ với điều khoản hiện hành trước khi triển khai:
-
-- Martingale / grid tăng lot sau lệnh thua
-- Arbitrage độ trễ (latency arbitrage)
-- Giao dịch khai thác lỗi giá của nhà cung cấp thanh khoản
-- High-frequency scalping với thời gian giữ lệnh cực ngắn
-- Copy trading giữa nhiều tài khoản
-- Giao dịch tập trung quanh thời điểm tin tức quan trọng (một số gói hạn chế)
-
-**Khuyến nghị thiết kế:** Tránh hoàn toàn martingale và grid. Không chỉ vì rủi ro vi phạm điều khoản, mà vì bản chất toán học của chúng tạo ra phân phối lợi nhuận đuôi dày — chính xác là thứ làm sụp đổ xác suất pass trong mô phỏng Monte Carlo.
-
----
-
-## 3. Triết lý thiết kế cốt lõi
-
-Đây là phần quan trọng nhất để AI tiếp nhận hiểu được "tại sao" đằng sau mọi quyết định kỹ thuật.
-
-### 3.1. Risk management là tầng ưu tiên cao nhất, không phải là tính năng phụ
-
-Kiến trúc phân tầng theo thứ tự ưu tiên:
-
-```
-Tầng 1 (cao nhất): Compliance Guard  — Chặn cứng mọi hành động vi phạm luật FTMO
-Tầng 2:            Risk Manager      — Quyết định kích thước lệnh, có được vào lệnh không
-Tầng 3:            Strategy Logic    — Quyết định KHI NÀO và HƯỚNG NÀO vào lệnh
-Tầng 4 (thấp nhất): Execution        — Gửi lệnh tới broker
+```mermaid
+flowchart TD
+    MT5["MT5 Market Watch"] --> Sync["download_mt5_data.py"]
+    Sync --> Lake["Parquet market-data lake + SQLite catalog"]
+    Lake --> Research["run_research.py"]
+    Research --> Strategy["Strategy + indicators"]
+    Strategy --> Engine["BacktestEngine"]
+    Engine --> Risk["RiskManager + ComplianceGuard"]
+    Engine --> Paths["Two independent PnL paths"]
+    Paths --> Reports["HTML, PNG, CSV, JSON reports"]
+    Paths --> Robustness["Rolling / Walk-forward / Monte Carlo"]
 ```
 
-Quy tắc bất biến: **Tầng dưới không bao giờ override được tầng trên.** Chiến lược có thể muốn vào lệnh, nhưng nếu Risk Manager nói không, thì là không. Risk Manager có thể muốn vào lệnh size X, nhưng nếu Compliance Guard thấy điều đó có thể đẩy equity gần giới hạn, size bị cắt hoặc lệnh bị chặn.
+### Layer responsibilities
 
-Lý do: trong bài toán tối đa xác suất pass, một lệnh bị bỏ lỡ chỉ tốn cơ hội; một lệnh vi phạm limit làm mất toàn bộ dự án.
-
-### 3.2. Cùng một risk module dùng chung cho backtest và live
-
-Đây là quyết định kiến trúc then chốt. Risk module phải được viết sao cho:
-- Backtest engine gọi nó để mô phỏng
-- Live bot gọi nó để giao dịch thật
-
-Nếu viết hai bản riêng, chắc chắn sẽ có sai lệch, và kết quả backtest trở nên vô nghĩa. Interface của risk module nên thuần túy: nhận vào trạng thái tài khoản + tín hiệu, trả ra quyết định. Không tự gọi API broker, không tự đọc file.
-
-### 3.3. Mỗi kết quả backtest chỉ là một mẫu, không phải sự thật
-
-Backtest trên dữ liệu lịch sử cho ra **một** đường equity duy nhất — một mẫu rút từ phân phối các kịch bản có thể xảy ra. Nó không trả lời được câu hỏi "xác suất tôi pass là bao nhiêu". Chỉ mô phỏng Monte Carlo mới trả lời được.
-
-Hệ quả thực tế: **không bao giờ ra quyết định dựa trên một con số backtest đơn lẻ.** Mọi quyết định giữ/bỏ một thay đổi phải dựa trên phân phối kết quả Monte Carlo.
-
-### 3.4. Mọi tham số nằm trong config, không nằm trong code
-
-Tách biệt để khi thay đổi risk % không vô tình sửa logic chiến lược, và để mỗi lần chạy thí nghiệm có thể log lại chính xác bộ tham số đã dùng.
-
-### 3.5. Ghi lại mọi thứ, kể cả thất bại
-
-Chi tiết ở [mục 9](#9-hệ-thống-ghi-log-nghiên-cứu-hai-tầng). Nguyên tắc: một hướng đi đã thử và thất bại mà không được ghi lại sẽ bị thử lại sau vài tuần.
+| Layer | Main location | Responsibility | Must not do |
+|---|---|---|---|
+| Data sync | `ftmo_bot/tools/download_mt5_data.py` | Read MT5 history and maintain a resumable local lake | Run strategy logic |
+| Storage | `ftmo_bot/tools/market_data_store.py` | Partition bars by symbol/timeframe/month; catalog coverage and fingerprints | Invent or alter prices |
+| Indicators | `ftmo_bot/indicators/` | Vectorised causal features derived from OHLC | Place orders or read account state |
+| Strategies | `ftmo_bot/strategy/` | Convert available bar information into BUY/SELL signals | Size a position or enforce FTMO rules |
+| Backtest engine | `ftmo_bot/backtest/engine.py` | Next-bar execution, one-position state machine, OHLC exits, equity curve | Optimise strategy parameters implicitly |
+| Risk and compliance | `ftmo_bot/risk/` | Position sizing, FTMO hard-limit checks and account state | Generate market signals |
+| Robustness | `ftmo_bot/backtest/monte_carlo.py`, `walk_forward.py` | Resampling, multiple historical starts and chronological OOS tests | Modify raw source data |
+| Reporting | `ftmo_bot/tools/report_builder.py`, `report_charts.py` | Immutable report artifacts and scope labelling | Fill unavailable MT5-only fields with made-up values |
 
 ---
 
-## 4. Lựa chọn công nghệ: Python vs MQL5
+## 3. Repository map
 
-### 4.1. Quyết định: dùng cả hai, mỗi thứ cho một giai đoạn
+```text
+mt5_backtest_sys/
+├── ftmo_bot/
+│   ├── configs/
+│   │   ├── mt5_sync.yaml         # MT5 download scope
+│   │   ├── research.yaml         # batch-research scope and robustness switches
+│   │   ├── instruments.yaml      # exact broker symbols and execution profiles
+│   │   ├── ftmo_rules.yaml       # account/challenge hard limits
+│   │   └── risk_params.yaml      # position risk and execution assumptions
+│   ├── data/market/mt5/          # ignored Parquet lake + SQLite catalog
+│   ├── indicators/               # reusable OHLC indicator functions
+│   ├── strategy/
+│   │   ├── base.py               # BaseStrategy contract
+│   │   ├── no1.py … no10.py      # numbered research candidates
+│   │   └── candidate_base.py     # shared ATR-based order helper
+│   ├── backtest/
+│   │   ├── engine.py             # execution and paired-path primitives
+│   │   ├── monte_carlo.py
+│   │   └── walk_forward.py
+│   ├── risk/
+│   │   ├── risk_manager.py
+│   │   └── compliance_guard.py
+│   ├── tools/
+│   │   ├── download_mt5_data.py
+│   │   ├── run_research.py
+│   │   ├── report_builder.py
+│   │   └── report_charts.py
+│   ├── reports/                  # ignored generated reports and research catalog
+│   └── main.py                   # quick single-symbol batch runner
+├── tests/
+└── ftmo_bot_workflow_handoff.md
+```
 
-| Giai đoạn | Công nghệ | Lý do |
-|---|---|---|
-| Nghiên cứu, backtest, Monte Carlo, tối ưu | **Python** | Hệ sinh thái phân tích dữ liệu mạnh, tốc độ lặp thí nghiệm nhanh |
-| Chạy demo / forward test / FTMO Challenge | **MQL5 (Expert Advisor)** | Chạy native trong MT5, độ trễ thấp, ổn định 24/7, không phụ thuộc tiến trình ngoài |
-
-### 4.2. Ưu điểm của Python (giai đoạn nghiên cứu)
-
-- `pandas` / `numpy` cho xử lý dữ liệu giá và kết quả lệnh
-- Thư viện backtest (`backtrader`, `vectorbt`) hoặc engine tự viết
-- Monte Carlo, walk-forward analysis, phân tích độ nhạy tham số — viết bằng Python nhanh hơn MQL5 nhiều lần
-- Dễ vẽ biểu đồ, dễ log, dễ tích hợp ML nếu cần sau này
-
-### 4.3. Ưu điểm của MQL5 (giai đoạn chạy thật)
-
-- EA chạy trong tiến trình MT5, không có lớp trung gian → độ trễ thấp
-- Không cần tiến trình Python chạy song song → ít điểm hỏng hơn
-- Nếu Python mất kết nối với MT5 khi đang có lệnh mở, hậu quả có thể rất nghiêm trọng — EA native không có rủi ro này
-- FTMO yêu cầu giao dịch qua nền tảng MT4/MT5 của họ
-
-### 4.4. Ràng buộc kỹ thuật cần lưu ý
-
-- Thư viện `MetaTrader5` cho Python **chỉ chạy trên Windows** (phụ thuộc MT5 terminal). Nếu dùng VPS, phải là VPS Windows.
-- Việc port code từ Python sang MQL5 là công đoạn có rủi ro sai lệch logic. Phải có bước đối chiếu: chạy cùng một khoảng dữ liệu trên cả hai, so sánh danh sách lệnh sinh ra. Xem [mục 10](#10-gate-criteria--tiêu-chí-chuyển-giai-đoạn).
+`data/` and `reports/` are generated local artifacts. Source code and YAML configuration belong in Git; downloaded history and generated reports do not.
 
 ---
 
-## 5. Kiến trúc thư mục dự án
+## 4. Data workflow: MT5 to reproducible Parquet research lake
 
-```
-ftmo-bot/
-├── README.md                    # Tổng quan, hướng dẫn chạy
-├── .gitignore                   # Loại trừ data/, logs/, credentials
-│
-├── configs/                     # TẤT CẢ tham số nằm ở đây, không nằm trong code
-│   ├── ftmo_rules.yaml          # Giới hạn của gói FTMO đang nhắm tới
-│   ├── strategy_params.yaml     # Tham số chiến lược (SL, TP, filter...)
-│   └── risk_params.yaml         # Risk % mỗi lệnh, buffer an toàn
-│
-├── data/                        # Dữ liệu giá lịch sử (KHÔNG commit lên git)
-│   └── raw/
-│
-├── strategy/                    # Logic chiến lược thuần túy
-│   ├── base.py                  # Interface chung cho mọi chiến lược
-│   └── <ten_chien_luoc>.py      # Sinh tín hiệu: trả ra signal, không đặt lệnh
-│
-├── risk/                        # TRÁI TIM CỦA HỆ THỐNG
-│   ├── risk_manager.py          # Position sizing, kiểm tra điều kiện vào lệnh
-│   └── compliance_guard.py      # Chặn cứng theo luật FTMO
-│
-├── backtest/
-│   ├── engine.py                # Chạy backtest, GỌI risk module giống hệt live
-│   └── monte_carlo.py           # Mô phỏng phân phối kết quả
-│
-├── tools/
-│   ├── experiment_logger.py     # Ghi log thí nghiệm tự động (đã có, xem phụ lục)
-│   └── analyze_experiments.py   # Đọc log, so sánh các lần chạy
-│
-├── mql5_ea/                     # Code MQL5 sau khi port
-│   ├── FtmoBot.mq5
-│   └── RiskManager.mqh          # Bản port của risk module
-│
-├── logs/                        # Nhật ký chạy demo/live (KHÔNG commit)
-├── reports/                     # Kết quả backtest, biểu đồ, báo cáo Monte Carlo
-└── research_journal.md          # Nhật ký nghiên cứu viết tay (xem mục 9)
-```
+### 4.1 Synchronisation
 
-### Ghi chú kiến trúc
+`download_mt5_data.py` connects to the locally installed Windows MT5 terminal. It reads all visible Market Watch symbols and configured timeframes, then writes monthly Parquet partitions.
 
-- `strategy/` **không** được biết gì về FTMO rules hay account balance. Nó chỉ nhận dữ liệu giá và trả ra tín hiệu. Điều này giúp thay chiến lược mà không phải sửa risk module.
-- `risk/` **không** được gọi API broker. Nó nhận trạng thái tài khoản dưới dạng tham số và trả ra quyết định. Điều này cho phép backtest và live dùng chung.
-- Ranh giới này phải được giữ nghiêm ngặt. Nếu thấy mình đang import broker API vào `strategy/`, đó là dấu hiệu kiến trúc đang bị phá vỡ.
+The sync is resumable:
+
+1. Read the latest timestamp for a symbol/timeframe from the SQLite catalog.
+2. Request only new MT5 history plus a small overlap.
+3. Merge and de-duplicate the affected monthly partition.
+4. Record coverage, row count, status and content hash in the catalog.
+
+This avoids repeatedly reading a monolithic CSV and gives every research job a data fingerprint.
+
+### 4.2 Why Parquet instead of CSV
+
+- Columnar reads: load only the OHLC/time columns needed for a job.
+- Partition pruning: a bounded time range reads only relevant months.
+- Stable schema and efficient storage for many symbols/timeframes.
+- SQLite catalog answers “what data is available?” without scanning files.
+- A report can retain a fingerprint of the exact partitions used.
+
+Parquet is not an MT5 strategy-tester simulation. It is the historical storage format used by this Python engine.
+
+### 4.3 Admission gates before a job
+
+Before running a strategy/symbol/timeframe job, `run_research.py` checks:
+
+- exact broker symbol is present and enabled in `instruments.yaml`;
+- strategy explicitly supports the asset class and timeframe;
+- OHLC data has no duplicate timestamps, null OHLC values or impossible high/low values;
+- minimum bar count is appropriate for the timeframe.
+
+Gaps are reported as warnings because weekends/market closures are legitimate; structural data corruption fails the job.
 
 ---
 
-## 6. Pipeline 6 giai đoạn
+## 5. Strategy and execution workflow
 
-```
-[1] Nghiên cứu chiến lược          Python, dữ liệu lịch sử, backtest thô
-             │
-             ▼
-[2] Backtest & Monte Carlo         Đo P(pass FTMO), không chỉ đo lợi nhuận
-             │
-             ▼
-[3] Risk Management Module         Xây guard cứng theo luật FTMO
-             │
-             ▼
-[4] Port sang MQL5 EA              Viết lại logic native + đối chiếu kết quả
-             │
-             ▼
-[5] Demo / Forward test            Chạy thật trên demo, so với backtest
-             │
-             ▼
-[6] FTMO Challenge                 Chạy thật, giám sát liên tục
-```
+### 5.1 Strategy contract
 
-Mỗi mũi tên là một **gate** — chỉ được đi qua khi đạt tiêu chí định lượng ở [mục 10](#10-gate-criteria--tiêu-chí-chuyển-giai-đoạn). Không chuyển giai đoạn vì "cảm thấy ổn".
-
-### Giai đoạn 1 — Nghiên cứu chiến lược
-
-Mục tiêu: tìm ra một chiến lược có edge dương và ổn định.
-
-Nội dung:
-- Chọn thị trường (cặp tiền, vàng, chỉ số) và khung thời gian
-- Chọn họ chiến lược (trend-following, mean-reversion, breakout...)
-- Viết logic sinh tín hiệu trong `strategy/`
-- Backtest thô để xác nhận có edge dương (chưa cần tối ưu)
-
-Đầu ra: một chiến lược có profit factor > 1 trên dữ liệu lịch sử, và một danh sách kết quả từng lệnh.
-
-**Cảnh báo overfitting:** Tối ưu tham số trên toàn bộ dữ liệu lịch sử sẽ cho kết quả đẹp nhưng vô dụng. Phải chia dữ liệu: in-sample để tối ưu, out-of-sample để kiểm chứng, và walk-forward analysis nếu có điều kiện.
-
-### Giai đoạn 2 — Backtest & Monte Carlo
-
-Mục tiêu: chuyển từ "chiến lược này lãi bao nhiêu" sang "chiến lược này có bao nhiêu % khả năng pass FTMO".
-
-Chi tiết phương pháp ở [mục 8](#8-monte-carlo--phương-pháp-kiểm-định-chính).
-
-### Giai đoạn 3 — Risk Management Module
-
-Mục tiêu: xây tầng bảo vệ không cho phép vi phạm luật.
-
-Chi tiết ở [mục 7](#7-risk-management-module--trái-tim-của-hệ-thống).
-
-Lưu ý thứ tự: mặc dù risk module được liệt kê ở giai đoạn 3, trong thực tế nên viết **khung sơ bộ** của nó ngay từ giai đoạn 2, vì Monte Carlo phải mô phỏng cả cơ chế guard (bot dừng khi chạm daily limit làm thay đổi đường equity phía sau).
-
-### Giai đoạn 4 — Port sang MQL5
-
-Mục tiêu: có một EA chạy native trong MT5 với logic giống hệt bản Python.
-
-Rủi ro lớn nhất: sai lệch logic khi port. Bắt buộc phải đối chiếu.
-
-### Giai đoạn 5 — Demo / Forward test
-
-Mục tiêu: xác nhận EA hoạt động đúng trong điều kiện thị trường thật (spread thay đổi, slippage, requote, gap cuối tuần) — những thứ backtest không mô phỏng đầy đủ.
-
-Đây là giai đoạn hay bị bỏ qua và là nguyên nhân thất bại phổ biến.
-
-### Giai đoạn 6 — FTMO Challenge
-
-Chạy thật. Chi tiết vận hành ở [mục 11](#11-vận-hành-và-giám-sát-khi-chạy-live).
-
----
-
-## 7. Risk Management Module — trái tim của hệ thống
-
-### 7.1. Hai thành phần
-
-**(a) `compliance_guard.py` — Chặn cứng**
-
-Trả lời câu hỏi: "Hành động này có thể dẫn tới vi phạm luật FTMO không?"
-
-Trách nhiệm:
-- Theo dõi equity real-time (không chỉ balance)
-- Tính daily loss đã sử dụng so với giới hạn, reset đúng thời điểm mốc ngày của broker
-- Tính total drawdown so với giới hạn (theo đúng loại static/trailing của gói)
-- Chặn mở lệnh mới khi đã dùng quá một ngưỡng an toàn của daily loss
-- Đóng toàn bộ lệnh và ngừng giao dịch trong ngày khi chạm ngưỡng dừng khẩn cấp
-
-Nguyên tắc thiết kế quan trọng: **luôn dùng buffer an toàn, không chạm sát giới hạn thật.**
-Nếu daily limit là 5%, guard nên dừng ở khoảng 3–3.5%. Lý do: slippage, spread giãn, gap giá có thể làm loss vượt quá dự tính giữa thời điểm quyết định và thời điểm khớp lệnh. Buffer này phải là tham số trong config để Monte Carlo có thể kiểm định.
-
-**(b) `risk_manager.py` — Quyết định kích thước**
-
-Trả lời câu hỏi: "Nếu được phép vào lệnh, thì vào bao nhiêu?"
-
-Trách nhiệm:
-- Tính lot size từ: % rủi ro mỗi lệnh, khoảng cách stop loss, giá trị pip của symbol
-- Giới hạn tổng rủi ro đồng thời khi có nhiều lệnh mở
-- Xem xét tương quan giữa các cặp tiền (ví dụ EURUSD và GBPUSD thường cùng chiều — mở cả hai không phải là hai lệnh độc lập về rủi ro)
-- Giảm size khi đã gần các ngưỡng cảnh báo
-
-### 7.2. Interface đề xuất
-
-Thiết kế sao cho backtest và live gọi giống hệt nhau:
+Every strategy inherits `BaseStrategy` and implements:
 
 ```python
-decision = risk_manager.evaluate(
-    account_state=AccountState(
-        balance=...,
-        equity=...,
-        initial_balance=...,
-        peak_equity=...,
-        daily_start_equity=...,
-        open_positions=[...],
-    ),
-    signal=Signal(direction=..., entry=..., stop_loss=..., take_profit=...),
-    ftmo_rules=rules_from_config,
-)
-
-# decision.allowed: bool
-# decision.lot_size: float
-# decision.reason: str   -- ghi vào log để truy vết sau này
+prepare_data(df)    # add only causal indicator columns
+generate_signal(row)  # return BUY / SELL signal or None
 ```
 
-Trường `reason` rất quan trọng: khi bot không vào lệnh, bạn cần biết là do chiến lược không có tín hiệu, hay do risk module chặn, và chặn vì lý do gì.
+The current numbered candidates are deliberately diverse research hypotheses:
 
-### 7.3. Kiểm thử riêng cho risk module
-
-Risk module phải có test riêng, độc lập với chiến lược. Các kịch bản tối thiểu cần test:
-
-- Giả lập chuỗi thua liên tiếp → guard có dừng đúng ngưỡng không?
-- Giả lập gap giá qua đêm gây loss lớn → guard có xử lý được không?
-- Giả lập mốc reset ngày mới → daily loss có reset đúng thời điểm broker không?
-- Giả lập equity tăng rồi giảm → trailing drawdown có tính đúng từ đỉnh không?
-- Giả lập nhiều lệnh mở cùng lúc → tổng rủi ro có bị vượt không?
-
-Đây là phần code duy nhất trong dự án mà việc viết unit test là **bắt buộc**, không phải tùy chọn.
-
----
-
-## 8. Monte Carlo — phương pháp kiểm định chính
-
-### 8.1. Vấn đề cần giải quyết
-
-Backtest cho ra một đường equity. Nhưng thứ tự các lệnh thắng/thua trong tương lai sẽ khác. Câu hỏi thực sự quan trọng là: **nếu cùng bộ lệnh đó xảy ra theo thứ tự khác, có bao nhiêu % khả năng vi phạm limit?**
-
-Minh họa: cùng 100 kết quả lệnh y hệt nhau, chỉ xáo trộn thứ tự, cho ra các đường equity có hình dạng và mức drawdown hoàn toàn khác nhau. Backtest gốc chỉ cho bạn một trong số đó.
-
-### 8.2. Các phương pháp mô phỏng
-
-| Phương pháp | Cách làm | Kiểm định điều gì |
-|---|---|---|
-| **Reshuffle thứ tự lệnh** | Hoán vị ngẫu nhiên danh sách kết quả lệnh | Rủi ro do trình tự thắng/thua xấu |
-| **Bootstrap (lấy mẫu có hoàn lại)** | Lấy ngẫu nhiên có lặp từ tập kết quả | Kịch bản chuỗi thua tệ hơn cả lịch sử |
-| **Random bỏ bớt lệnh** | Loại ngẫu nhiên một tỷ lệ lệnh | Rủi ro khi VPS/internet lỗi, bỏ lỡ tín hiệu |
-| **Biến đổi win rate / R:R** | Điều chỉnh nhẹ tham số phân phối | Độ nhạy khi thị trường tương lai khác quá khứ |
-| **Thêm slippage ngẫu nhiên** | Trừ một lượng ngẫu nhiên vào mỗi lệnh | Rủi ro thực thi trong điều kiện thật |
-
-### 8.3. Điểm mấu chốt: phải mô phỏng kèm cơ chế guard
-
-Đây là sai lầm phổ biến nhất khi làm Monte Carlo cho FTMO.
-
-**Cách sai:** Tính đường equity từ chuỗi lệnh, rồi so sánh max drawdown với giới hạn 10%.
-
-**Cách đúng:** Trong vòng lặp mô phỏng, áp dụng cả cơ chế guard — khi equity chạm ngưỡng daily loss, bot dừng giao dịch phần còn lại của ngày, nên các lệnh tiếp theo trong ngày đó không xảy ra. Điều này làm thay đổi toàn bộ đường equity phía sau.
-
-Nếu không mô phỏng guard, kết quả Monte Carlo sẽ sai lệch theo cả hai hướng: đánh giá quá cao rủi ro vi phạm drawdown, và đánh giá quá cao khả năng đạt profit target.
-
-### 8.4. Đầu ra cần thu thập
-
-Với mỗi lần chạy Monte Carlo (khuyến nghị tối thiểu 1000 lần mô phỏng), thu thập:
-
-- `p_pass`: tỷ lệ % số lần mô phỏng đạt profit target mà không vi phạm limit nào — **đây là chỉ số quan trọng nhất**
-- `p_fail_daily_loss`: % số lần fail vì vi phạm daily loss
-- `p_fail_max_dd`: % số lần fail vì vi phạm max drawdown
-- `p_timeout`: % số lần không vi phạm gì nhưng không đạt target kịp thời hạn
-- Phân phối max drawdown: trung bình, percentile 5/50/95
-- Phân phối số ngày cần để đạt target
-
-Việc tách riêng các nguyên nhân fail rất hữu ích cho việc chẩn đoán: nếu fail chủ yếu vì timeout thì cần tăng size hoặc tăng tần suất giao dịch; nếu fail vì daily loss thì cần giảm size hoặc siết guard.
-
-### 8.5. Ví dụ code tham chiếu (bản rút gọn)
-
-```python
-import numpy as np
-
-def monte_carlo_ftmo(trade_results, rules, n_sims=1000, seed=42):
-    """
-    trade_results: mảng % thay đổi equity của từng lệnh, lấy từ backtest
-    rules: dict chứa profit_target_pct, daily_loss_pct, max_dd_pct, ...
-
-    LƯU Ý: bản rút gọn này chưa mô phỏng cơ chế guard theo ngày.
-    Bản đầy đủ phải nhóm lệnh theo ngày và dừng giao dịch khi chạm daily limit.
-    """
-    rng = np.random.default_rng(seed)
-    outcomes = {"pass": 0, "fail_dd": 0, "timeout": 0}
-    max_dds = []
-
-    for _ in range(n_sims):
-        shuffled = rng.permutation(trade_results)
-        equity = 100 * np.cumprod(1 + shuffled / 100)
-        running_max = np.maximum.accumulate(np.concatenate([[100], equity]))[1:]
-        dd = (equity - running_max) / running_max * 100
-        max_dds.append(dd.min())
-
-        if dd.min() <= -rules["max_dd_pct"]:
-            outcomes["fail_dd"] += 1
-        elif equity.max() >= 100 + rules["profit_target_pct"]:
-            outcomes["pass"] += 1
-        else:
-            outcomes["timeout"] += 1
-
-    return {
-        "p_pass": outcomes["pass"] / n_sims,
-        "p_fail_dd": outcomes["fail_dd"] / n_sims,
-        "p_timeout": outcomes["timeout"] / n_sims,
-        "max_dd_mean": float(np.mean(max_dds)),
-        "max_dd_p95": float(np.percentile(max_dds, 5)),  # 5th percentile = tệ nhất
-    }
-```
-
-Bản đầy đủ cần bổ sung: nhóm lệnh theo ngày giao dịch, áp dụng daily loss guard, xử lý minimum trading days, và mô phỏng slippage.
-
----
-
-## 9. Hệ thống ghi log nghiên cứu hai tầng
-
-Đây là hệ thống được thiết kế để tránh vấn đề phổ biến nhất trong nghiên cứu chiến lược cá nhân: sau vài tuần, không còn nhớ đã thử gì, tại sao chọn tham số hiện tại, và vô tình thử lại những hướng đã thất bại.
-
-Phương pháp mô phỏng cách làm việc của researcher thực thụ: **structured experiment log** (để so sánh định lượng) kết hợp **lab notebook** (để giữ mạch tư duy). Thiếu một trong hai đều gây vấn đề.
-
-### 9.1. Tầng 1 — Research Journal (viết tay, dạng tường thuật)
-
-File: `research_journal.md`
-
-Mỗi entry theo cấu trúc khoa học: **giả thuyết → thay đổi → kết quả → diễn giải → quyết định → bước tiếp**.
-
-Quy tắc bất biến: **viết giả thuyết TRƯỚC khi chạy thí nghiệm.** Nếu viết sau khi đã thấy kết quả, sẽ rơi vào bias tự hợp lý hóa — luôn tìm được lý do giải thích bất cứ kết quả nào, và mất hoàn toàn giá trị của việc kiểm định giả thuyết.
-
-Template:
-
-```markdown
-## Entry #001 — YYYY-MM-DD
-
-**Run ID liên kết:** run_xxxxxxxx
-
-**Giả thuyết (viết TRƯỚC khi chạy):**
-> Nếu tăng bộ lọc ATR để tránh vào lệnh lúc volatility thấp, win rate sẽ tăng
-> nhưng số lệnh/tháng giảm, có thể ảnh hưởng đến khả năng đạt profit target.
-
-**Thay đổi cụ thể:**
-- atr_filter_threshold: 0.0015 -> 0.0025
-
-**Kết quả:**
-- (dán số liệu hoặc link tới report)
-
-**Diễn giải — đúng hay sai giả thuyết? Vì sao?**
--
-
-**Quyết định:** [ ] Giữ  [ ] Revert  [ ] Cần test thêm
-
-**Bước tiếp theo:**
--
-```
-
-Ngoài ra, cuối mỗi tuần nên đọc lại toàn bộ entry trong tuần và viết một đoạn tổng kết: pattern nào lặp lại, hướng nào đang bế tắc, hướng nào đáng đào sâu.
-
-**Không xóa entry thất bại.** Chúng là phần giá trị nhất của journal.
-
-### 9.2. Tầng 2 — Experiment Log (máy tự ghi, dạng bảng)
-
-File: `experiments_log.csv`, sinh tự động bởi `tools/experiment_logger.py`.
-
-Mỗi lần chạy backtest hoặc Monte Carlo, code tự động append một dòng gồm:
-
-| Cột | Nội dung |
+| Files | Family |
 |---|---|
-| `run_id` | ID duy nhất, dùng để liên kết với journal |
-| `timestamp_utc` | Thời điểm chạy |
-| `git_commit` | Hash commit của code đã chạy — cho phép tái tạo chính xác |
-| `params_json` | Toàn bộ tham số đầu vào |
-| `metrics_json` | Toàn bộ kết quả đo được |
-| `notes` | Ghi chú ngắn, trỏ tới entry journal tương ứng |
+| `no1.py`, `no4.py`, `no6.py`, `no10.py` | trend/momentum |
+| `no3.py`, `no7.py`, `no9.py` | breakout / volatility expansion |
+| `no2.py`, `no5.py`, `no8.py` | mean reversion |
 
-Việc ghi `git_commit` là điểm then chốt: khi thấy một lần chạy cũ có kết quả tốt, bạn có thể quay lại chính xác version code đó.
+They are not selected production strategies. They should be compared, stress-tested and rejected or refined based on evidence.
 
-Cách dùng:
+### 5.2 Order lifecycle in `BacktestEngine`
 
-```python
-from tools.experiment_logger import log_experiment
+1. The strategy observes the completed OHLC bar at time **N**.
+2. If it returns a signal, the engine stores it as a pending order.
+3. The order fills at the **open of bar N+1**, not at bar N close.
+4. Execution applies adverse spread and slippage:
+   - BUY: `open + spread + slippage`
+   - SELL: `open - spread - slippage`
+5. Position size comes from current equity, risk %, stop distance, contract size and configured costs.
+6. Only one position may be open at a time.
+7. On the entry bar and later bars, the engine checks gap exits and OHLC SL/TP hits.
+8. If SL and TP are both reachable in one OHLC bar, **SL wins** (`stop_first`).
 
-run_id = log_experiment(
-    params={"risk_per_trade_pct": 0.5, "atr_filter_threshold": 0.0025,
-            "symbol": "XAUUSD", "timeframe": "M15"},
-    metrics={"win_rate": 0.47, "profit_factor": 1.35, "max_drawdown_pct": -6.8,
-             "monte_carlo_p_pass": 0.91, "num_trades": 142},
-    notes="Thử tăng ATR filter theo giả thuyết ở journal entry #007",
-)
+This is conservative and avoids same-bar look-ahead. It is still an OHLC approximation: it does not reconstruct tick order inside a candle.
+
+---
+
+## 6. Two independent PnL paths
+
+For every job, the runner creates two fresh engine/strategy/risk states. The paths must never share mutable state or equity.
+
+| Path | Loss gates | Purpose |
+|---|---|---|
+| **No-loss-constraint** | FTMO hard daily/total loss gates disabled | Primary strategy research result across the full history |
+| **FTMO-constrained** | Stops opening new positions after a hard daily/total-loss breach | Compliance comparison and Monte Carlo input |
+
+Both paths retain the same strategy logic, next-bar model, spread, slippage, commission model and independent compounding/position sizing. “No loss constraint” does **not** mean free or unrealistic execution; it only removes the two FTMO loss gates.
+
+The constrained path does not use the internal safety buffer as a hard research stop. It stops on actual configured FTMO hard limits.
+
+---
+
+## 7. Robustness workflow
+
+### 7.1 Primary result scope
+
+The following are calculated from the **no-loss-constraint** path:
+
+- performance KPIs and all metric tables;
+- trade ledger and trade-distribution/timing charts;
+- drawdown, daily returns and monthly-return map;
+- rolling-window results;
+- walk-forward train/select/test results.
+
+### 7.2 FTMO compliance scope
+
+The following use the **FTMO-constrained** path:
+
+- teal equity line in `01_equity_balance.png`;
+- hard-breach marker and compliance status;
+- Monte Carlo outcomes.
+
+The orange line in the same chart is the no-loss-constraint path, for comparison.
+
+### 7.3 Robustness methods
+
+| Method | Configuration | Meaning |
+|---|---|---|
+| Rolling window | `rolling` in `research.yaml` | Start a fresh no-loss account repeatedly through history; measures sensitivity to start date |
+| Monte Carlo | `monte_carlo` | Resample constrained trade-day blocks to estimate FTMO outcomes; not a forecast |
+| Walk-forward | `walk_forward` | Chronological train → select parameters → out-of-sample test without test-period parameter access |
+
+Use robustness checks progressively: first one symbol/timeframe/strategy, then selected candidates, then a larger batch. Do not enable 10,000 Monte Carlo simulations and broad parameter grids across every market pair in the first run.
+
+---
+
+## 8. Research orchestration
+
+### `main.py`: quick batch runner
+
+Use when one already-loaded symbol/timeframe should be tested against every discovered strategy.
+
+- Reads the Parquet lake first; falls back to legacy CSV only if present.
+- Uses the symbol/timeframe in `configs/strategy_params.yaml`.
+- Runs all discovered strategies.
+- Runs rolling windows and constrained Monte Carlo.
+- Does not run walk-forward optimisation.
+
+### `tools/run_research.py`: reproducible research runner
+
+Use for the normal research workflow.
+
+- Selects catalogued symbol/timeframe pairs from `configs/research.yaml`.
+- Runs compatibility/data-quality gates.
+- Stores a run manifest, job status and data fingerprint.
+- Supports rolling, Monte Carlo and walk-forward.
+- Creates one immutable report directory per completed strategy/pair job.
+
+`run_research.py` is the source of truth for batch research. `main.py` is a fast convenience runner, not a replacement for catalogued experiments.
+
+---
+
+## 9. Configuration ownership
+
+| File | Owns | Change when |
+|---|---|---|
+| `configs/mt5_sync.yaml` | MT5 data download universe, timeframe scope, start date | changing imported market data |
+| `configs/instruments.yaml` | exact symbol, asset class and execution profile | adding a broker symbol or calibrating contract/spread/slippage |
+| `configs/ftmo_rules.yaml` | account size, target and hard FTMO limits | changing challenge/account type |
+| `configs/risk_params.yaml` | risk per trade, open-risk cap and execution defaults | changing portfolio/risk assumptions |
+| `configs/strategy_params.yaml` or `<strategy>_params.yaml` | strategy parameters | changing an experiment hypothesis |
+| `configs/research.yaml` | research filters and robustness switches | choosing which research batch to run |
+
+Never silently change an execution or FTMO parameter inside strategy code. A report’s configuration snapshot is part of its reproducibility record.
+
+---
+
+## 10. Report contract
+
+Each completed job creates a unique timestamped folder under:
+
+```text
+ftmo_bot/reports/research/<research_run_id>/<strategy_symbol_timeframe>/<timestamp>/
 ```
 
-Sau đó dán `run_id` vào entry journal tương ứng. Hai tầng log liên kết với nhau qua ID này.
+Key artifacts:
 
-### 9.3. Phân tích log
+| Artifact | Scope |
+|---|---|
+| `report.html` | Offline visual dossier with embedded PNGs |
+| `report.json` | Machine-readable metrics, config, metadata and artifact list |
+| `trades.csv` | No-loss-constraint ledger |
+| `trades_constrained.csv` | FTMO-constrained ledger |
+| `equity_curve.csv` | FTMO-constrained equity/balance curve |
+| `equity_curve_unconstrained.csv` | No-loss-constraint equity/balance curve |
+| `daily_returns.csv`, `monthly_returns.csv` | No-loss-constraint returns |
+| `rolling_windows.csv`, `walk_forward.csv` | No-loss-constraint robustness results |
+| `images/01_equity_balance.png` | Both equity paths in one chart |
+| `images/07_monte_carlo.png` | FTMO-constrained Monte Carlo only |
 
-Cuối mỗi tuần hoặc khi cần ra quyết định:
+`N/A` is intentional for measurements unavailable in an OHLC Python engine, such as MT5 history quality, modeled ticks, margin level, swap, native MT5 deals/orders, MFE/MAE correlations or EA `OnTester` values. The report must not fabricate them.
 
-```python
-import pandas as pd
-from tools.experiment_logger import load_experiments
+---
 
-df = pd.DataFrame(load_experiments())
-# Trích metrics ra thành cột riêng để sort/filter
-metrics_df = pd.json_normalize(df["metrics"])
-params_df = pd.json_normalize(df["params"])
-full = pd.concat([df[["run_id", "git_commit", "notes"]], params_df, metrics_df], axis=1)
+## 11. Development workflow and quality gates
 
-# Ví dụ: xem các cấu hình có xác suất pass cao nhất
-full.sort_values("monte_carlo_p_pass", ascending=False).head(10)
+### Add or modify a strategy
+
+1. Create `ftmo_bot/strategy/<name>.py` with one concrete `*Strategy` class.
+2. Declare supported asset classes and timeframes explicitly.
+3. Keep indicators causal; use `.shift(1)` whenever a current comparison would otherwise use unavailable future data.
+4. Add default parameters in the strategy, then optional YAML overrides.
+5. Add regression tests for signal validity and any special execution behaviour.
+6. Run the complete test suite before committing.
+
+### Add a market
+
+1. Make it visible in MT5 Market Watch.
+2. Sync its history into the lake.
+3. Add its exact broker symbol to `instruments.yaml` with calibrated contract, point, spread, slippage and commission profile.
+4. Only then allow it into batch research.
+
+### Required checks before a commit
+
+```bat
+python -m unittest discover -s tests -v
+git diff --check
+git status
 ```
 
-Câu hỏi nên đặt ra khi phân tích: có tham số nào mà kết quả tốt chỉ xuất hiện ở một giá trị rất cụ thể không? Nếu có, đó là dấu hiệu overfitting — chiến lược tốt phải có vùng tham số ổn định, không phải một điểm nhọn.
-
-### 9.4. Log vận hành (khác với log nghiên cứu)
-
-Khi bot chạy demo/live, cần một loại log khác — log vận hành, ghi vào `logs/`:
-
-- Mọi lệnh: thời điểm, hướng, size, entry, SL, TP, lý do vào lệnh
-- Mọi lần risk module chặn: thời điểm, lý do chặn (trường `reason`)
-- Trạng thái risk theo chu kỳ: % daily loss đã dùng, % drawdown hiện tại, số lệnh đang mở
-- Mọi lỗi kỹ thuật: mất kết nối, requote, lệnh bị từ chối
-
-Log này phục vụ chẩn đoán khi có sự cố, và để đối chiếu kết quả forward test với backtest.
+The existing suite covers data storage, admission gates, execution integrity, paired paths, reports, candidate discovery and robustness primitives. A green suite does not validate financial profitability.
 
 ---
 
-## 10. Gate criteria — tiêu chí chuyển giai đoạn
+## 12. Operating sequence on Windows
 
-Nguyên tắc: mỗi gate phải là tiêu chí **định lượng, xác định trước**, không phải đánh giá chủ quan. Viết ra tiêu chí trước khi chạy thí nghiệm, không điều chỉnh tiêu chí sau khi thấy kết quả.
+```bat
+:: 1. Create/update the local data lake from MT5
+python ftmo_bot\tools\download_mt5_data.py
 
-Các ngưỡng dưới đây là đề xuất khởi điểm, cần điều chỉnh theo bối cảnh cụ thể của dự án.
+:: 2. Run a reproducible configured research batch
+python ftmo_bot\tools\run_research.py
 
-### Gate 1→2: Chiến lược có đáng kiểm định sâu không?
+:: Optional: fast run of all strategies for one configured symbol/timeframe
+python ftmo_bot\main.py
+```
 
-- [ ] Profit factor > 1.2 trên dữ liệu out-of-sample (không phải in-sample)
-- [ ] Số lệnh đủ lớn để có ý nghĩa thống kê (tối thiểu ~100 lệnh)
-- [ ] Edge không đến từ một vài lệnh ngoại lệ (kiểm tra: bỏ 5 lệnh lãi nhất, còn dương không?)
-- [ ] Kết quả ổn định qua các giai đoạn thị trường khác nhau, không chỉ một xu hướng
+Before the first MT5 sync, install dependencies in the same Python environment that will run the script and make sure the MT5 terminal is installed, logged in and has the required symbols visible in Market Watch.
 
-### Gate 2→3: Chiến lược có đủ khả năng pass không?
-
-- [ ] `p_pass` từ Monte Carlo ≥ 85–90% qua tối thiểu 1000 mô phỏng
-- [ ] `p_pass_across_history` từ rolling-window backtest ≥ 80%. Nếu chênh lệch lớn so với Monte Carlo, ưu tiên đánh giá theo chỉ số thấp hơn vì nó phản ánh rủi ro chế độ thị trường.
-- [ ] Soft-stop tầng Critical đã được xác nhận kích hoạt đúng trong ít nhất một vài window lịch sử có biến động mạnh.
-- [ ] `p_fail_daily_loss` và `p_fail_max_dd` đều ở mức chấp nhận được
-- [ ] Kết quả ổn định khi thay đổi seed ngẫu nhiên
-- [ ] Vùng tham số ổn định (không phải điểm nhọn — dấu hiệu overfitting)
-
-### Gate 3→4: Risk module đã đủ tin cậy chưa?
-
-- [ ] Toàn bộ unit test ở [mục 7.3](#73-kiểm-thử-riêng-cho-risk-module) đều pass
-- [ ] Đã test kịch bản cực đoan: gap giá lớn, chuỗi thua dài, nhiều lệnh mở đồng thời
-- [ ] Monte Carlo chạy lại có tích hợp guard, `p_pass` vẫn đạt ngưỡng
-- [ ] Buffer an toàn đã được kiểm định, không chỉ chọn theo cảm tính
-
-### Gate 4→5: Bản port MQL5 có khớp với bản Python không?
-
-- [ ] Chạy cả hai trên cùng một khoảng dữ liệu lịch sử
-- [ ] Danh sách lệnh sinh ra khớp nhau (cho phép sai lệch nhỏ do làm tròn/spread)
-- [ ] Các chỉ số tổng hợp (số lệnh, win rate, max DD) lệch dưới ngưỡng cho phép
-- [ ] Đã test EA xử lý đúng các tình huống kỹ thuật: mất kết nối, restart MT5, requote
-
-### Gate 5→6: Forward test có xác nhận backtest không?
-
-- [ ] Chạy demo tối thiểu 4–6 tuần liên tục (không ngắt quãng, không can thiệp tay)
-- [ ] Kết quả forward test nằm trong khoảng phân phối mà Monte Carlo dự đoán
-- [ ] Không có sự cố kỹ thuật nghiêm trọng nào chưa được xử lý
-- [ ] Risk module đã thực sự kích hoạt ít nhất một lần trong điều kiện thật và hoạt động đúng
-- [ ] Slippage và spread thực tế không làm sai lệch đáng kể so với giả định backtest
-
-**Lưu ý về gate cuối:** Nếu forward test cho kết quả lệch xa backtest, đừng vội điều chỉnh tham số để khớp. Đó thường là dấu hiệu backtest đã overfit hoặc có lỗi giả định (look-ahead bias, spread không thực tế). Quay lại giai đoạn 1–2 để chẩn đoán.
+For an initial safe experiment, limit `research.yaml` to one strategy, symbol and timeframe, set `max_jobs: 1`, use rolling windows, and keep Monte Carlo/walk-forward off until the basic result is understood.
 
 ---
 
-## 11. Vận hành và giám sát khi chạy live
+## 13. Known limitations and next decisions
 
-### 11.1. Hạ tầng
+1. The engine is bar-close OHLC, not tick replay; results can differ from MT5 Strategy Tester.
+2. Execution values are configured assumptions and must be calibrated per broker/account.
+3. Current instrument registry is limited to profiled metal symbols; data may exist for more symbols but unprofiled symbols are intentionally skipped.
+4. Numbered strategies are research baselines, not validated alpha.
+5. There is no EA/live execution layer yet. Build it only after choosing a strategy and defining an explicit parity test against this Python engine.
+6. FTMO terms and account rules are configuration inputs, not permanent facts; verify them before an actual challenge.
 
-- **VPS** đặt gần server broker để giảm độ trễ, chạy 24/5 không gián đoạn
-- Nếu dùng Python trong pipeline: bắt buộc VPS Windows
-- Cấu hình tự khởi động lại MT5 và EA sau khi VPS reboot
-- Đồng hồ hệ thống đồng bộ chính xác (ảnh hưởng tới mốc reset ngày)
+### Recommended next milestone
 
-### 11.2. Giám sát
-
-Bot phải tự báo cáo, không nên phải mở MT5 để kiểm tra thủ công. Tối thiểu cần:
-
-- **Cảnh báo tức thời** (Telegram/Discord/email) khi: mở lệnh, đóng lệnh, risk module chặn lệnh, chạm ngưỡng cảnh báo, có lỗi kỹ thuật
-- **Báo cáo định kỳ** cuối mỗi ngày giao dịch: số lệnh, P&L, % daily loss đã dùng, % drawdown hiện tại, khoảng cách còn lại tới profit target
-- **Dashboard trạng thái** (tùy chọn): xem nhanh các chỉ số quan trọng
-
-Chỉ số quan trọng nhất cần theo dõi liên tục: **khoảng cách còn lại tới mỗi giới hạn**, không phải P&L.
-
-### 11.3. Quy tắc can thiệp tay
-
-Xác định trước, viết ra giấy, khi nào được phép can thiệp:
-
-- Được phép: dừng bot khi phát hiện lỗi kỹ thuật rõ ràng (sai symbol, sai size, lệnh lặp)
-- Được phép: dừng bot trước sự kiện thị trường bất thường đã biết trước
-- **Không được phép:** can thiệp vì cảm thấy lo lắng khi bot đang thua theo đúng kế hoạch
-- **Không được phép:** tăng size để "gỡ lại" khi gần hết thời hạn
-
-Việc viết trước các quy tắc này khi đầu óc tỉnh táo là biện pháp bảo vệ chống lại quyết định cảm tính khi đang chịu áp lực.
-
-### 11.4. Nhật ký giao dịch trong lúc challenge
-
-Duy trì ghi chép hàng ngày: trạng thái tài khoản, sự kiện bất thường, cảm nhận về hành vi của bot. Đây là dữ liệu quý giá để cải thiện cho lần sau, dù pass hay fail.
-
----
-
-## 12. Những cạm bẫy đã biết
-
-Danh sách này nên được cập nhật liên tục trong quá trình dự án.
-
-### 12.1. Về nghiên cứu
-
-| Cạm bẫy | Biểu hiện | Cách phòng |
-|---|---|---|
-| **Overfitting** | Backtest đẹp bất thường, kết quả sụp khi đổi khoảng dữ liệu | Out-of-sample test, walk-forward, kiểm tra vùng tham số ổn định |
-| **Look-ahead bias** | Code vô tình dùng dữ liệu tương lai (ví dụ giá đóng cửa của nến hiện tại) | Rà soát kỹ logic, chỉ dùng dữ liệu đã hoàn tất tại thời điểm quyết định |
-| **Survivorship bias trong tối ưu** | Thử 200 biến thể, chọn cái tốt nhất, tưởng đó là edge | Ghi log mọi lần thử, xem cái tốt nhất có vượt trội có ý nghĩa không |
-| **Giả định spread cố định** | Backtest dùng spread lý tưởng, thực tế spread giãn lúc tin tức | Mô phỏng spread thay đổi, thêm slippage vào Monte Carlo |
-| **Quá ít lệnh** | Kết luận từ 30 lệnh | Yêu cầu tối thiểu ~100 lệnh, ưu tiên nhiều hơn |
-
-### 12.2. Về triển khai
-
-| Cạm bẫy | Biểu hiện | Cách phòng |
-|---|---|---|
-| **Sai lệch khi port Python→MQL5** | EA giao dịch khác bản backtest | Đối chiếu bắt buộc ở Gate 4→5 |
-| **Daily loss tính theo balance thay vì equity** | Vi phạm mà bot không biết | Guard phải giám sát equity |
-| **Sai mốc reset ngày** | Reset theo giờ local thay vì giờ broker | Xác nhận mốc ngày của broker, test kỹ |
-| **Không xử lý gap cuối tuần** | Lệnh giữ qua cuối tuần gặp gap lớn | Cân nhắc đóng lệnh trước cuối tuần, hoặc mô phỏng gap trong Monte Carlo |
-| **Không có buffer an toàn** | Chạm limit do slippage dù logic tính đúng | Dừng ở ngưỡng thấp hơn limit thật |
-
-### 12.3. Về tâm lý và quy trình
-
-| Cạm bẫy | Biểu hiện | Cách phòng |
-|---|---|---|
-| **Điều chỉnh tiêu chí sau khi thấy kết quả** | Hạ ngưỡng gate để được đi tiếp | Viết gate criteria trước, không sửa |
-| **Bỏ qua forward test** | Nhảy thẳng từ backtest vào challenge | Coi Gate 5 là bắt buộc |
-| **Can thiệp tay khi bot đang thua** | Phá vỡ giả định của toàn bộ nghiên cứu | Quy tắc can thiệp viết trước |
-| **Không ghi log thất bại** | Lặp lại hướng đã thử | Journal giữ nguyên mọi entry |
-
----
-
-## 13. Trạng thái hiện tại và bước tiếp theo
-
-### 13.1. Đã hoàn thành
-
-- Thống nhất kiến trúc tổng thể và triết lý thiết kế (ưu tiên xác suất pass hơn lợi nhuận)
-- Quyết định công nghệ: Python cho nghiên cứu, MQL5 cho vận hành
-- Thiết kế pipeline 6 giai đoạn với gate criteria
-- Xây dựng hệ thống log nghiên cứu hai tầng (`research_journal.md` + `experiment_logger.py`)
-- Làm rõ phương pháp Monte Carlo và điểm mấu chốt về mô phỏng kèm guard
-
-### 13.2. Chưa quyết định
-
-Những điểm sau cần được làm rõ trước khi bắt đầu giai đoạn 1:
-
-- **Gói FTMO cụ thể** (ảnh hưởng trực tiếp tới các con số trong `ftmo_rules.yaml`, và tới việc drawdown là static hay trailing)
-- **Thị trường và khung thời gian** (forex majors, vàng, chỉ số — mỗi loại có đặc tính volatility và spread khác nhau)
-- **Họ chiến lược** (trend-following, mean-reversion, breakout — chưa chọn)
-
-### 13.3. Bước tiếp theo đề xuất
-
-1. Xác định ba điểm ở mục 13.2
-2. Tạo cấu trúc thư mục và khởi tạo git repo
-3. Viết `configs/ftmo_rules.yaml` với các giới hạn của gói đã chọn
-4. Viết khung sơ bộ của risk module (đủ để Monte Carlo mô phỏng guard)
-5. Lấy dữ liệu lịch sử và viết chiến lược đầu tiên trong `strategy/`
-6. Chạy backtest thô + Monte Carlo, log lại bằng `experiment_logger.py`, ghi entry đầu tiên vào journal
-
----
-
-## 14. Phụ lục: Code tham chiếu
-
-### 14.1. `tools/experiment_logger.py`
-
-Script ghi log thí nghiệm tự động. Các hàm chính:
-
-- `log_experiment(params, metrics, notes) -> run_id` — ghi một dòng mới, tự động lấy git commit hash và timestamp UTC
-- `load_experiments() -> list[dict]` — đọc toàn bộ log, parse sẵn `params` và `metrics` thành dict
-- `best_by(metric_key, top_n, higher_is_better)` — in ra top N lần chạy tốt nhất theo một metric
-
-Phụ thuộc: chỉ dùng thư viện chuẩn của Python (`csv`, `json`, `subprocess`, `uuid`, `datetime`, `pathlib`). Không cần cài thêm gì.
-
-### 14.2. `research_journal.md`
-
-Template nhật ký nghiên cứu dạng tường thuật, cấu trúc đã mô tả ở [mục 9.1](#91-tầng-1--research-journal-viết-tay-dạng-tường-thuật).
-
----
-
-## Ghi chú cuối cho AI tiếp nhận tài liệu
-
-Nếu bạn là một AI assistant được giao tiếp tục dự án này, những điểm sau đáng lưu ý:
-
-1. **Đừng nhảy thẳng vào việc viết chiến lược sinh lời.** Kiến trúc và risk module quan trọng hơn. Một chiến lược tầm thường với risk management tốt có xác suất pass cao hơn một chiến lược xuất sắc không có guard.
-
-2. **Mọi con số về luật FTMO trong tài liệu này cần được kiểm chứng lại** với điều khoản hiện hành, vì chúng có thể đã thay đổi.
-
-3. **Khi người dùng đề xuất một thay đổi, hãy hỏi giả thuyết trước.** Điều này phù hợp với phương pháp làm việc đã thống nhất ở mục 9, và giúp tránh việc thử ngẫu nhiên không có định hướng.
-
-4. **Cảnh giác với các đề xuất tăng rủi ro để đạt target nhanh hơn.** Chúng thường xuất hiện khi gần hết thời hạn và là nguyên nhân thất bại phổ biến.
-
-5. **Giao dịch tài chính có rủi ro mất vốn.** Không có chiến lược nào đảm bảo pass, và kết quả backtest không đảm bảo kết quả tương lai. Tài liệu này mô tả một quy trình kỹ thuật, không phải lời khuyên đầu tư.
+Run a narrow research batch for each candidate on XAUUSD/XAUUSDm M5 and M15, inspect the no-loss primary statistics, then enable constrained Monte Carlo and a small walk-forward grid only for candidates that remain credible out-of-sample.
