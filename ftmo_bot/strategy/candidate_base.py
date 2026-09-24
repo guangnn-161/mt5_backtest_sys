@@ -35,5 +35,5 @@ class CandidateBase(BaseStrategy):
             return None
         entry, stop, target = float(row.close), float(atr) * stop_atr, float(atr) * target_atr
         if side == 'BUY':
-            return {'type': side, 'entry': entry, 'sl': entry - stop, 'tp': entry + target}
-        return {'type': side, 'entry': entry, 'sl': entry + stop, 'tp': entry - target}
+            return self.order_intent(side, entry, entry - stop, entry + target, tag=self.key)
+        return self.order_intent(side, entry, entry + stop, entry - target, tag=self.key)

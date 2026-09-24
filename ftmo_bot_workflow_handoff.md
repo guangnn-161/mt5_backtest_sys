@@ -160,18 +160,16 @@ They are not selected production strategies. They should be compared, stress-tes
 
 ### 5.2 Order lifecycle in `BacktestEngine`
 
-1. The strategy observes the completed OHLC bar at time **N**.
-2. If it returns a signal, the engine stores it as a pending order.
-3. The order fills at the **open of bar N+1**, not at bar N close.
-4. Execution applies adverse spread and slippage:
-   - BUY: `open + spread + slippage`
-   - SELL: `open - spread - slippage`
-5. Position size comes from current equity, risk %, stop distance, contract size and configured costs.
-6. Only one position may be open at a time.
-7. On the entry bar and later bars, the engine checks gap exits and OHLC SL/TP hits.
-8. If SL and TP are both reachable in one OHLC bar, **SL wins** (`stop_first`).
+1. The strategy observes the completed OHLC bar at time **N** and creates a broker-independent intent.
+2. An intent is `MARKET`, `LIMIT`, or `STOP`; all are first eligible at **bar N+1**, never at bar N close.
+3. `MARKET` fills at the next open plus adverse spread/slippage.
+4. `LIMIT` fills only when its next eligible bar's high/low reaches its trigger. A gap through the limit is filled at the limit, never with unearned price improvement.
+5. `STOP` fills when high/low reaches its trigger; a gap beyond the stop fills at the worse bar open.
+6. `LIMIT` and `STOP` may specify `valid_for_bars`; otherwise they remain pending until filled or cancelled by the runtime.
+7. Position size comes from current equity, risk %, stop distance, contract size and configured costs. The current policy permits one open position and one pending order.
+8. On the entry bar and later bars, the engine checks gap exits and OHLC SL/TP hits. If SL and TP are both reachable in one OHLC bar, **SL wins** (`stop_first`).
 
-This is conservative and avoids same-bar look-ahead. It is still an OHLC approximation: it does not reconstruct tick order inside a candle.
+Every event is retained in the run's `order_events.csv` (`submitted`, `filled`, `expired`, or `rejected_risk`). This is conservative and avoids same-bar look-ahead. It remains an OHLC approximation: it does not reconstruct tick order inside a candle.
 
 ---
 
@@ -347,9 +345,9 @@ For an initial safe experiment, limit `research.yaml` to one strategy, symbol an
 2. Execution values are configured assumptions and must be calibrated per broker/account.
 3. Current instrument registry is limited to profiled metal symbols; data may exist for more symbols but unprofiled symbols are intentionally skipped.
 4. Numbered strategies are research baselines, not validated alpha.
-5. There is no EA/live execution layer yet. Build it only after choosing a strategy and defining an explicit parity test against this Python engine.
+5. The shared order-intent contract is now ready for paper/live adapters, but there is no MT5 execution adapter or reconciliation loop yet.
 6. FTMO terms and account rules are configuration inputs, not permanent facts; verify them before an actual challenge.
 
 ### Recommended next milestone
 
-Run a narrow research batch for each candidate on XAUUSD/XAUUSDm M5 and M15, inspect the no-loss primary statistics, then enable constrained Monte Carlo and a small walk-forward grid only for candidates that remain credible out-of-sample.
+Run a narrow research batch for each candidate on XAUUSD/XAUUSDm M5 and M15, compare market versus explicit limit/stop entry hypotheses, then enable constrained Monte Carlo and a small walk-forward grid only for candidates that remain credible out-of-sample. After that, build an MT5 demo adapter against the same order-intent contract.

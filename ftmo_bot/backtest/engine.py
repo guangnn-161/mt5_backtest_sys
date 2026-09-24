@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from execution import OhlcExecutionModel, OrderIntent, PendingOrder
+
 
 class BacktestEngine:
     """Run one-position-at-a-time strategies on OHLC bars.
@@ -57,6 +59,10 @@ class BacktestEngine:
         self.intrabar_policy = execution.get("intrabar_policy", "stop_first")
         if self.intrabar_policy != "stop_first":
             raise ValueError("Only the conservative 'stop_first' policy is supported")
+        self.max_pending_orders = int(execution.get("max_pending_orders", 1))
+        if self.max_pending_orders <= 0:
+            raise ValueError("max_pending_orders must be positive")
+        self.execution_model = OhlcExecutionModel()
 
         self.data_timezone = ZoneInfo(
             compliance_guard.ftmo_rules.get("data_timezone", "UTC")
@@ -115,26 +121,22 @@ class BacktestEngine:
             price_diff = trade["entry"] - price
         return self.balance + price_diff * trade["size"] * self.contract_size
 
-    def _open_trade(self, signal: dict, row, timestamp) -> dict | None:
-        side = signal.get("type")
-        if side not in {"BUY", "SELL"}:
-            raise ValueError(f"Unsupported signal type: {side!r}")
-
-        reference_entry = float(signal["entry"])
-        signal_stop = float(signal["sl"])
-        signal_target = float(signal["tp"])
-        if side == "BUY" and not signal_stop < reference_entry < signal_target:
-            raise ValueError("BUY signal must satisfy sl < entry < tp")
-        if side == "SELL" and not signal_target < reference_entry < signal_stop:
-            raise ValueError("SELL signal must satisfy tp < entry < sl")
+    def _open_trade(self, pending_order: PendingOrder, raw_fill_price: float,
+                    fill_reason: str, timestamp) -> dict | None:
+        """Create a position from an actual execution, not directly from a signal."""
+        intent = pending_order.intent
+        intent.validate_price_geometry()
+        side = intent.side
+        reference_entry = intent.entry
+        signal_stop = intent.sl
+        signal_target = intent.tp
         stop_distance = abs(reference_entry - signal_stop)
         target_distance = abs(signal_target - reference_entry)
         if stop_distance <= 0 or target_distance <= 0:
             return None
 
         adverse_cost = self.spread_price + self.slippage_price
-        market_open = float(row["open"])
-        entry = market_open + adverse_cost if side == "BUY" else market_open - adverse_cost
+        entry = raw_fill_price + adverse_cost if side == "BUY" else raw_fill_price - adverse_cost
         stop = entry - stop_distance if side == "BUY" else entry + stop_distance
         target = entry + target_distance if side == "BUY" else entry - target_distance
 
@@ -156,7 +158,11 @@ class BacktestEngine:
         entry_commission = self.commission_round_turn * size / 2.0
         self.balance -= entry_commission
         return {
-            "signal_time": signal["signal_time"],
+            "order_id": pending_order.order_id,
+            "order_type": intent.order_type.value,
+            "order_tag": intent.tag,
+            "signal_time": pending_order.signal_time,
+            "order_created_time": pending_order.signal_time,
             "entry_time": timestamp,
             "type": side,
             "entry": entry,
@@ -165,6 +171,7 @@ class BacktestEngine:
             "size": size,
             "balance_before_entry": balance_before_entry,
             "entry_commission_usd": entry_commission,
+            "entry_fill_reason": fill_reason,
         }
 
     def _resolve_exit(self, trade: dict, row) -> tuple[float, str] | None:
@@ -247,7 +254,9 @@ class BacktestEngine:
         trades: list[dict] = []
         equity_curve: list[dict] = []
         open_trade = None
-        pending_signal = None
+        pending_orders: list[PendingOrder] = []
+        order_events: list[dict] = []
+        next_order_number = 1
 
         peak_equity = self.initial_balance
         daily_start_balance = self.initial_balance
@@ -278,13 +287,40 @@ class BacktestEngine:
                 daily_start_balance = self.balance
 
             stress_mode = self.continue_after_failure and first_fail_time is not None
-            if pending_signal is not None and open_trade is None and (
-                not trading_halted or stress_mode
-            ):
-                open_trade = self._open_trade(pending_signal, row, timestamp)
-                if open_trade is not None:
-                    open_trade["post_failure_entry"] = stress_mode
-                pending_signal = None
+            # An intent becomes eligible only after the close that created it.
+            # Pending stop/limit orders remain live until their explicit expiry.
+            still_pending = []
+            for order in pending_orders:
+                if order.is_expired_before(position):
+                    order_events.append({
+                        "time": timestamp, "order_id": order.order_id,
+                        "event": "expired", "order_type": order.intent.order_type.value,
+                    })
+                else:
+                    still_pending.append(order)
+            pending_orders = still_pending
+
+            if open_trade is None and (not trading_halted or stress_mode):
+                for order in list(pending_orders):
+                    if position < order.eligible_index:
+                        continue
+                    decision = self.execution_model.entry_fill(order.intent, row)
+                    if decision is None:
+                        continue
+                    # A fill is terminal for this intent even if risk sizing rejects it.
+                    pending_orders.remove(order)
+                    open_trade = self._open_trade(
+                        order, decision.raw_price, decision.reason, timestamp
+                    )
+                    order_events.append({
+                        "time": timestamp, "order_id": order.order_id,
+                        "event": "filled" if open_trade is not None else "rejected_risk",
+                        "order_type": order.intent.order_type.value,
+                        "reason": decision.reason,
+                    })
+                    if open_trade is not None:
+                        open_trade["post_failure_entry"] = stress_mode
+                    break  # The current portfolio model permits one open position.
 
             worst_equity = self.balance
             if open_trade is not None:
@@ -370,10 +406,31 @@ class BacktestEngine:
             if (
                 signal
                 and open_trade is None
-                and pending_signal is None
+                and len(pending_orders) < self.max_pending_orders
                 and (stress_mode or (trading_state == "safe" and not trading_halted))
             ):
-                pending_signal = {**signal, "signal_time": timestamp}
+                intent = OrderIntent.from_signal(signal)
+                intent.validate_price_geometry()
+                order_id = f"ORD-{next_order_number:06d}"
+                next_order_number += 1
+                expires_after = (
+                    position + intent.valid_for_bars
+                    if intent.valid_for_bars is not None
+                    else None
+                )
+                pending_orders.append(PendingOrder(
+                    order_id=order_id,
+                    intent=intent,
+                    signal_time=timestamp,
+                    created_index=position,
+                    eligible_index=position + 1,
+                    expires_after_index=expires_after,
+                ))
+                order_events.append({
+                    "time": timestamp, "order_id": order_id, "event": "submitted",
+                    "order_type": intent.order_type.value,
+                    "valid_for_bars": intent.valid_for_bars,
+                })
 
             equity_curve.append(
                 {
@@ -402,6 +459,8 @@ class BacktestEngine:
                 "continue_after_failure": self.continue_after_failure,
                 "enforce_limits": self.enforce_limits,
                 "enforce_internal_stop": self.enforce_internal_stop,
+                "order_events": pd.DataFrame(order_events),
+                "pending_orders_at_end": len(pending_orders),
             }
         )
         return df_trades

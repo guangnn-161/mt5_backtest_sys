@@ -52,6 +52,18 @@ class AlwaysSignalStrategy:
         }
 
 
+class PendingOrderStrategy:
+    def __init__(self, signal):
+        self.signal = signal
+        self.sent = False
+
+    def generate_signal(self, row):
+        if self.sent:
+            return None
+        self.sent = True
+        return dict(self.signal)
+
+
 class IntegrityTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -127,6 +139,51 @@ class IntegrityTests(unittest.TestCase):
         self.assertAlmostEqual(trade.entry, 100.25)
         self.assertAlmostEqual(trade.pnl_usd, -49.05)
         self.assertLessEqual(abs(trade.pnl_usd), 50.0)
+
+    def test_buy_limit_fills_only_when_low_reaches_trigger(self):
+        frame = self.frame([
+            ("2026-01-02 10:00", 100, 100.5, 99.5, 100),
+            ("2026-01-02 10:05", 100, 100.3, 98.8, 99.7),
+        ])
+        strategy = PendingOrderStrategy({
+            "type": "BUY", "order_type": "LIMIT", "entry": 99.0,
+            "sl": 98.0, "tp": 101.0, "valid_for_bars": 1,
+        })
+        trades = self.engine(frame, strategy).run()
+        self.assertEqual(len(trades), 1)
+        trade = trades.iloc[0]
+        self.assertEqual(trade.order_type, "LIMIT")
+        self.assertEqual(trade.entry_fill_reason, "limit_touched")
+        self.assertAlmostEqual(trade.entry, 99.25)  # trigger plus adverse costs
+
+    def test_stop_gap_fills_at_open_not_at_optimistic_trigger(self):
+        frame = self.frame([
+            ("2026-01-02 10:00", 100, 100.5, 99.5, 100),
+            ("2026-01-02 10:05", 102, 102.4, 101.8, 102.2),
+        ])
+        strategy = PendingOrderStrategy({
+            "type": "BUY", "order_type": "STOP", "entry": 101.0,
+            "sl": 100.0, "tp": 104.0,
+        })
+        trades = self.engine(frame, strategy).run()
+        trade = trades.iloc[0]
+        self.assertEqual(trade.entry_fill_reason, "stop_gap_through")
+        self.assertAlmostEqual(trade.entry, 102.25)
+
+    def test_pending_limit_expires_before_later_bar_can_trigger_it(self):
+        frame = self.frame([
+            ("2026-01-02 10:00", 100, 100.5, 99.5, 100),
+            ("2026-01-02 10:05", 100, 100.2, 99.5, 100),
+            ("2026-01-02 10:10", 100, 100.4, 98.0, 99),
+        ])
+        strategy = PendingOrderStrategy({
+            "type": "BUY", "order_type": "LIMIT", "entry": 99.0,
+            "sl": 98.0, "tp": 101.0, "valid_for_bars": 1,
+        })
+        trades = self.engine(frame, strategy).run()
+        self.assertTrue(trades.empty)
+        events = trades.attrs["order_events"]
+        self.assertEqual(list(events.event), ["submitted", "expired"])
 
     def test_open_trade_is_closed_at_end_of_data(self):
         frame = self.frame(

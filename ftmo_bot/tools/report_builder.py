@@ -15,9 +15,9 @@ import pandas as pd
 from tools.backtest_metrics import calculate_metrics, daily_equity, monthly_returns
 from tools.report_charts import render_charts
 
-TRADE_COLUMNS = ['signal_time', 'entry_time', 'exit_time', 'type', 'entry', 'sl', 'tp',
+TRADE_COLUMNS = ['order_id', 'order_type', 'order_tag', 'signal_time', 'order_created_time', 'entry_time', 'exit_time', 'type', 'entry', 'sl', 'tp',
                  'exit_price', 'size', 'gross_pnl_usd', 'commission_usd', 'pnl_usd',
-                 'pnl_pct', 'balance', 'closed_by', 'post_failure_entry']
+                 'pnl_pct', 'balance', 'closed_by', 'entry_fill_reason', 'post_failure_entry']
 ROLLING_COLUMNS = ['start_date', 'end_date', 'outcome', 'days_to_result',
                    'max_dd_in_window_pct', 'num_trades', 'num_trades_full_simulation',
                    'post_failure_trades', 'ending_balance_full_simulation']
@@ -245,7 +245,7 @@ def build_html(strategy, run_id, m, meta, trades, images, config):
     css = (Path(__file__).parent / 'templates/report.css').read_text(encoding='utf-8')
     demo = '<div class="demo">SYNTHETIC DEMO — layout preview only; not actual strategy results.</div>' if meta.get('is_demo') else ''
     nav = ''.join(f'<a href="#{anchor}">{title}</a>' for anchor,title in [('overview','Overview'),('performance','Statistics'),('risk','Equity & risk'),('trades','Trades'),('calendar','Monthly'),('robustness','Robustness'),('ledger','Ledger'),('methods','Methodology')])
-    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','No-loss-constraint trades'),('equity_curve.csv','FTMO-constrained equity'),('trades_constrained.csv','FTMO-constrained trades'),('equity_curve_unconstrained.csv','No-loss-constraint equity'),('rolling_windows.csv','No-loss rolling windows'),('walk_forward.csv','No-loss walk-forward windows'),('daily_returns.csv','No-loss daily returns'),('monthly_returns.csv','No-loss monthly returns')])
+    downloads = ''.join(f'<a href="{name}" download>{label}</a>' for name,label in [('report.json','Report JSON'),('trades.csv','No-loss-constraint trades'),('order_events.csv','No-loss order lifecycle'),('equity_curve.csv','FTMO-constrained equity'),('trades_constrained.csv','FTMO-constrained trades'),('equity_curve_unconstrained.csv','No-loss-constraint equity'),('rolling_windows.csv','No-loss rolling windows'),('walk_forward.csv','No-loss walk-forward windows'),('daily_returns.csv','No-loss daily returns'),('monthly_returns.csv','No-loss monthly returns')])
     return f'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(strategy)} · Backtest research report</title><style>{css}</style></head><body><main class="shell">
 <div class="masthead"><div class="brand">QUANT / RESEARCH</div><div class="edition">STRATEGY TESTER REPORT · {esc(meta['created_at'])}</div></div>{demo}
 <header class="hero"><div class="eyebrow">Systematic trading · performance dossier</div><h1>{esc(strategy.upper())}</h1><p>{esc(meta.get('symbol','N/A'))} · {esc(meta.get('timeframe','N/A'))} &nbsp; / &nbsp; {esc(meta.get('period_start','N/A'))} → {esc(meta.get('period_end','N/A'))}</p>
@@ -290,6 +290,7 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     unconstrained_curve = unconstrained_attrs.get(
         'equity_curve', pd.DataFrame(columns=['time', 'balance', 'equity', 'is_failed'])
     ).copy()
+    order_events = unconstrained_attrs.get('order_events', attrs.get('order_events', pd.DataFrame())).copy()
     # Legacy/demo callers may not provide a second path. In that case their sole
     # path remains the report's primary result.
     trades = unconstrained_trades if unconstrained_df_trades is not None else constrained_trades
@@ -315,7 +316,7 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     payload = {'schema_version': 1, 'run_id': run_id, 'strategy': strategy_name,
                'metadata': meta, 'metrics': full_metrics, 'configuration': config,
                'artifacts': ['report.html', 'report.json', 'trades.csv', 'equity_curve.csv',
-                             'trades_constrained.csv', 'equity_curve_unconstrained.csv',
+                             'trades_constrained.csv', 'equity_curve_unconstrained.csv', 'order_events.csv',
                              'rolling_windows.csv', 'walk_forward.csv', 'daily_returns.csv', 'monthly_returns.csv']
                             + ['images/' + p.name for p in images]}
     (folder / 'report.json').write_text(json.dumps(clean_json(payload), ensure_ascii=False,
@@ -323,6 +324,7 @@ def save_run_report(strategy_name, run_id, trade_history, metrics, df_trades=Non
     for name, frame in [('trades',trades),('equity_curve',constrained_curve),
                         ('trades_constrained', constrained_trades),
                         ('equity_curve_unconstrained', unconstrained_curve),
+                        ('order_events', order_events),
                         ('rolling_windows',rolling_results),
                         ('walk_forward',walk_forward_results),
                         ('daily_returns',daily),('monthly_returns',monthly)]:
