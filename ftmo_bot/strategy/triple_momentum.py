@@ -4,6 +4,8 @@ from indicators.momentum_indicators import add_ema, add_macd
 import pandas as pd
 
 class TripleMomentumStrategy(BaseStrategy):
+    supported_asset_classes = ('metal',)
+    supported_timeframes = ('M5', 'M15')
     def __init__(self, params: dict = None):
         default_params = {
             'rsi_min': 55,

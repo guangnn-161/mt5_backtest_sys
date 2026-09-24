@@ -2,7 +2,20 @@ risk_per_trade_pct: 0.5
 max_open_risk_pct: 1.5
 daily_loss_buffer_pct: 1.0
 total_loss_buffer_pct: 1.5
-max_slippage_points: 20
-# Thêm vào cuối file risk_params.yaml hiện có
 caution_threshold_ratio: 0.6    # Vào tầng Caution khi đã dùng 60% ngưỡng an toàn
 critical_threshold_ratio: 0.9   # Vào tầng Critical khi đã dùng 90% ngưỡng an toàn
+
+# Deterministic, deliberately conservative XAUUSD execution assumptions.
+# Calibrate these values against the exact broker/account before trusting results.
+execution:
+  contract_size: 100
+  point_size: 0.01
+  spread_points: 20
+  slippage_points: 5
+  commission_per_lot_round_turn_usd: 0.0
+  intrabar_policy: stop_first
+  # Portfolio policy is one open position and, by default, one pending entry.
+  # A strategy can emit MARKET, LIMIT, or STOP intents. LIMIT/STOP orders are
+  # eligible from the next completed bar and only fill when that bar reaches the
+  # trigger. OHLC cannot prove intrabar order, so SL wins all SL/TP ambiguity.
+  max_pending_orders: 1
